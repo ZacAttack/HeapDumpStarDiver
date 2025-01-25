@@ -1,24 +1,43 @@
 mod util;
+use clap;
 use collections::HashMap;
 use std::{fs, collections};
-use std::fs::File;
 use jvm_hprof::{*};
 use jvm_hprof::heap_dump::{FieldType, FieldValue, PrimitiveArrayType, SubRecord};
 
 fn main() {
-    println!("Hello, world!");
+    let app = clap::Command::new("Analyze Hprof")
+        .arg(
+            clap::Arg::new("file")
+                .short('f')
+                .long("file")
+                .required(true)
+                .value_name("FILE")
+                .help("Heap dump file to read"),
+        )
+        .subcommand(clap::Command::new("dump-objects")
+            .about("Display Object (and other associated) heap dump subrecords to stdout"))
+        .subcommand(clap::Command::new("count-records")
+            .about("Display the number of each of the top level hprof record types")
+        );
+    let matches = app.get_matches();
 
-    //"/Users/zpolicze/Downloads/seas-cloud-searcher_prod-lor1_1908905_live_heapdump.hprof"
-    let file = File::open("/Users/zpolicze/Downloads/seas-cloud-searcher_prod-lor1_1908905_live_heapdump.hprof");
-    count_records(file.unwrap());
+    let file_path = matches.get_one::<String>("file").expect("file must be specified");
 
-}
+    let file = fs::File::open(file_path).unwrap_or_else(|_| panic!("Could not open file at path: {}", file_path));
 
-fn count_records(file: fs::File) {
     let memmap = unsafe { memmap::MmapOptions::new().map(&file) }.unwrap();
 
     let hprof: Hprof = parse_hprof(&memmap[..]).unwrap();
 
+    matches.subcommand().map(|(subcommand, _)| match subcommand {
+        "dump-objects" => dump_objects(&hprof),
+        "count-records" => count_records(&hprof),
+        _ => panic!("Unknown subcommand"),
+    });
+}
+
+fn count_records(hprof: &Hprof) {
     // start with zero counts for all types
     let mut counts = RecordTag::iter()
         .map(|r| (r, 0_u64))
