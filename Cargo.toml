@@ -9,3 +9,4 @@ arrow-schema = "54.0.0"
 jvm-hprof = { version = "0.1.0", path = "../../bitbucket/jvm-hprof-rs-li-hackweek" }
 memmap = "0.7.0"
 parquet = "54.0.0"
+clap = "4.5.27"
