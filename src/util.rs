@@ -57,14 +57,9 @@ pub fn generate_schema_from_type(
     obj_id_to_class_obj_id: &collections::HashMap<Id, Id>,
     classes: &collections::HashMap<Id, EzClass>,
     prim_array_obj_id_to_type: &collections::HashMap<Id, PrimitiveArrayType>,
-    objectId: u64
-) -> RecordBatch
+) -> Schema
 {
-    let mut schema_field_vec: Vec<Field> = vec![];
-    schema_field_vec.push(Field::new("instance_id", DataType::UInt64, false));
-    let mut data_vec:Vec<ArrayRef> = vec![];
-    data_vec.push(Arc::new(UInt64Array::from(vec![objectId])));
-
+    let mut field_vec: Vec<Field> = vec![];
     for fd in field_descriptors.iter() {
         let (input, field_val) = fd
             .field_type()
@@ -79,74 +74,28 @@ pub fn generate_schema_from_type(
                     .map(|class_obj_id| {
                         // case where the field_ref_id is in the obj_id_to_class_object
                         // (essentially this is a reference to a single instance)
-
-                        let class_type = classes
-                            .get(class_obj_id)
-                            .map(|c| c.name)
-                            .unwrap_or("(class not found)");
-
-                        let resolved_class_type;
-                        if (field_ref_id.id() == 0) {
-                            resolved_class_type = "null";
-                        } else {
-                            resolved_class_type = class_type;
-                        }
-                        let class_type_vector = Arc::new(StringArray::from(vec![resolved_class_type]));
-                        let field_id = Arc::new(UInt64Array::from(vec![field_ref_id.id()]));
-                        // TODO: Storing the type as a string in this struct is pretty inefficient.
-                        // we're just going to end up making many many copies of what is the same string
-                        // all over the place.  If we found disk size of the generated parquet's to be
-                        // enormous, this would be a good place to start looking for optimizations.
-                        let struct_array = StructArray::from(vec![
-                            (
-                                Arc::new(Field::new("id", DataType::UInt64, false)),
-                                field_id.clone() as ArrayRef,
-                            ),
-                            (
-                                Arc::new(Field::new("type", DataType::Utf8, false)),
-                                class_type_vector.clone() as ArrayRef,
-                            )
-                        ]);
-
-                        schema_field_vec.push(Field::new(field_name, DataType::Struct(
+                        field_vec.push(Field::new(field_name, DataType::Struct(
                             Fields::from(vec![
                                 Field::new("id", DataType::UInt64, false),
                                 Field::new("type", DataType::Utf8, false)])
                         ), false));
-                        data_vec.push(Arc::new(struct_array));
+                        // println!("{:?}", input);
+                        // println!("{} {}: field_ref_id: {}, field_ref_type: {}", field_name, &fd.name_id(), field_ref_id, classes.get(obj_id_to_class_obj_id.get(&field_ref_id).unwrap()).unwrap().name);
+                        // println!("class_obj_id: {}, class_obj_type: {}", class_obj_id, classes.get(class_obj_id).unwrap().name);
                     })
                     .or_else(|| {
                         // Case where this is a primitive type array
                         prim_array_obj_id_to_type
                             .get(&field_ref_id)
                             .map(|prim_type| {
-                                let primitive_array_name: String;
-                                if (field_ref_id.id() == 0) {
-                                    primitive_array_name = "null".parse().unwrap();
-                                } else {
-                                    primitive_array_name = format!("{}[]", prim_type.java_type_name());
-                                }
-
-                                let class_type_vector = Arc::new(StringArray::from(vec![primitive_array_name]));
-                                let field_id = Arc::new(UInt64Array::from(vec![field_ref_id.id()]));
-
-                                let struct_array = StructArray::from(vec![
-                                    (
-                                        Arc::new(Field::new("id", DataType::UInt64, false)),
-                                        field_id.clone() as ArrayRef,
-                                    ),
-                                    (
-                                        Arc::new(Field::new("type", DataType::Utf8, false)),
-                                        class_type_vector.clone() as ArrayRef,
-                                    )
-                                ]);
-                                schema_field_vec.push(Field::new(field_name, DataType::Struct(
+                                // field_vec.push(Field::new(field_name, DataType::List(Arc::new(Field::new("id", DataType::UInt64, false))), false));
+                                field_vec.push(Field::new(field_name, DataType::Struct(
                                     Fields::from(vec![
                                         Field::new("id", DataType::UInt64, false),
                                         Field::new("type", DataType::Utf8, false)])
                                 ), false));
-                                data_vec.push(Arc::new(struct_array));
-                            })
+                            });
+                        None
                     })
                     .or_else(|| {
                         classes.get(&field_ref_id).map(|dest_class| {
@@ -158,49 +107,39 @@ pub fn generate_schema_from_type(
                     });
             }
             FieldValue::ObjectId(None) => {
-                // Push a vector with x
-                schema_field_vec.push(Field::new(field_name, DataType::Null, true));
-                data_vec.push(Arc::new(NullArray::new(1)));
+                field_vec.push(Field::new(field_name, DataType::Struct(
+                    Fields::from(vec![
+                        Field::new("id", DataType::UInt64, false),
+                        Field::new("type", DataType::Utf8, false)])
+                ), false));
+                // field_vec.push(Field::new(field_name, DataType::Null, true));
             }
             FieldValue::Boolean(v) => {
-                schema_field_vec.push(Field::new(field_name, DataType::Boolean, false));
-                //     data_vec.push(Arc::new(UInt64Array::from(vec![objectId])));
-                data_vec.push(Arc::new(BooleanArray::from(vec![v])));
+                field_vec.push(Field::new(field_name, DataType::Boolean, false));
             }
             FieldValue::Char(v) => {
-                // push a vector with x
-                schema_field_vec.push(Field::new(field_name, DataType::UInt16, false));
-                data_vec.push(Arc::new(UInt16Array::from(vec![v])));
+                field_vec.push(Field::new(field_name, DataType::UInt16, false));
             }
             FieldValue::Float(v) => {
-                schema_field_vec.push(Field::new(field_name, DataType::Float32, false));
-                data_vec.push(Arc::new(Float32Array::from(vec![v])));
+                field_vec.push(Field::new(field_name, DataType::Float32, false));
             }
             FieldValue::Double(v) => {
-                schema_field_vec.push(Field::new(field_name, DataType::Float64, false));
-                data_vec.push(Arc::new(Float64Array::from(vec![v])));
+                field_vec.push(Field::new(field_name, DataType::Float64, false));
             }
             FieldValue::Byte(v) => {
-                schema_field_vec.push(Field::new(field_name, DataType::Int8, false));
-                data_vec.push(Arc::new(Int8Array::from(vec![v])));
+                field_vec.push(Field::new(field_name, DataType::Int8, false));
             }
             FieldValue::Short(v) => {
-                schema_field_vec.push(Field::new(field_name, DataType::Int16, false));
-                data_vec.push(Arc::new(Int16Array::from(vec![v])));
+                field_vec.push(Field::new(field_name, DataType::Int16, false));
             }
             FieldValue::Int(v) => {
-                schema_field_vec.push(Field::new(field_name, DataType::Int32, false));
-                data_vec.push(Arc::new(Int32Array::from(vec![v])));
+                field_vec.push(Field::new(field_name, DataType::Int32, false));
             }
             FieldValue::Long(v) => {
-                schema_field_vec.push(Field::new(field_name, DataType::Int64, false));
-                data_vec.push(Arc::new(Int64Array::from(vec![v])));
+                field_vec.push(Field::new(field_name, DataType::Int64, false));
             }
         }
     }
 
-    RecordBatch::try_new(
-        Arc::new(Schema::new(schema_field_vec)),
-        data_vec
-    ).unwrap()
+    Schema::new(field_vec)
 }
