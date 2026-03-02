@@ -1,9 +1,8 @@
 use std::collections;
-use std::sync::Arc;
-use arrow_array::{ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, NullArray, RecordBatch, StringArray, StructArray, UInt16Array, UInt64Array};
-use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
-use jvm_hprof::{EzClass, Hprof, Id};
-use jvm_hprof::heap_dump::{FieldDescriptor, FieldDescriptors, FieldValue, PrimitiveArrayType};
+use arrow_array::RecordBatch;
+use arrow_schema::{DataType, Field, Fields, Schema};
+use jvm_hprof::{Hprof, Id};
+use jvm_hprof::heap_dump::{FieldDescriptor, FieldValue};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -54,57 +53,39 @@ pub fn generate_schema_from_type(
     field_descriptors: &Vec<FieldDescriptor>,
     mut field_val_input: &[u8],
     utf8: &collections::HashMap<Id, &str>,
-    obj_id_to_class_obj_id: &collections::HashMap<Id, Id>,
-    classes: &collections::HashMap<Id, EzClass>,
-    prim_array_obj_id_to_type: &collections::HashMap<Id, PrimitiveArrayType>,
+    declaring_classes: Option<&Vec<&str>>,
 ) -> Schema
 {
     let mut field_vec: Vec<Field> = vec![];
-    for fd in field_descriptors.iter() {
+    let mut name_counts: collections::HashMap<&str, usize> = collections::HashMap::new();
+    for (i, fd) in field_descriptors.iter().enumerate() {
         let (input, field_val) = fd
             .field_type()
             .parse_value(field_val_input, hprof.header().id_size())
             .unwrap();
         field_val_input = input;
-        let field_name: &str = utf8.get(&fd.name_id()).unwrap_or_else(|| &MISSING_UTF8);
+        let base_name: &str = utf8.get(&fd.name_id()).unwrap_or_else(|| &MISSING_UTF8);
+        let count = name_counts.entry(base_name).or_insert(0);
+        let field_name = if *count == 0 {
+            base_name.to_string()
+        } else {
+            // Prefix with declaring class short name for disambiguation
+            let class_prefix = declaring_classes
+                .and_then(|dc| dc.get(i))
+                .map(|c| c.rsplit('/').next().unwrap_or(c))
+                .unwrap_or("unknown");
+            format!("{}@{}", class_prefix, base_name)
+        };
+        *count += 1;
         match field_val {
-            FieldValue::ObjectId(Some(field_ref_id)) => {
-                obj_id_to_class_obj_id
-                    .get(&field_ref_id)
-                    .map(|class_obj_id| {
-                        // case where the field_ref_id is in the obj_id_to_class_object
-                        // (essentially this is a reference to a single instance)
-                        field_vec.push(Field::new(field_name, DataType::Struct(
-                            Fields::from(vec![
-                                Field::new("id", DataType::UInt64, false),
-                                Field::new("type", DataType::Utf8, false)])
-                        ), false));
-                        // println!("{:?}", input);
-                        // println!("{} {}: field_ref_id: {}, field_ref_type: {}", field_name, &fd.name_id(), field_ref_id, classes.get(obj_id_to_class_obj_id.get(&field_ref_id).unwrap()).unwrap().name);
-                        // println!("class_obj_id: {}, class_obj_type: {}", class_obj_id, classes.get(class_obj_id).unwrap().name);
-                    })
-                    .or_else(|| {
-                        // Case where this is a primitive type array
-                        prim_array_obj_id_to_type
-                            .get(&field_ref_id)
-                            .map(|prim_type| {
-                                // field_vec.push(Field::new(field_name, DataType::List(Arc::new(Field::new("id", DataType::UInt64, false))), false));
-                                field_vec.push(Field::new(field_name, DataType::Struct(
-                                    Fields::from(vec![
-                                        Field::new("id", DataType::UInt64, false),
-                                        Field::new("type", DataType::Utf8, false)])
-                                ), false));
-                            });
-                        None
-                    })
-                    .or_else(|| {
-                        classes.get(&field_ref_id).map(|dest_class| {
-                            // This is a class reference case, we can probably ignore this, though clazz references can be legit, let's drop for MVP
-                        })
-                    })
-                    .unwrap_or_else(|| {
-                        // not found, which.... we should log, but we'll avoid it for now
-                    });
+            FieldValue::ObjectId(Some(_)) => {
+                // All reference types (instance, primitive array, class, unresolvable)
+                // use the same schema: Struct{id, type}
+                field_vec.push(Field::new(field_name, DataType::Struct(
+                    Fields::from(vec![
+                        Field::new("id", DataType::UInt64, false),
+                        Field::new("type", DataType::Utf8, false)])
+                ), false));
             }
             FieldValue::ObjectId(None) => {
                 field_vec.push(Field::new(field_name, DataType::Struct(
