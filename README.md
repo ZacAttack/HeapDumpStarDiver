@@ -2,9 +2,9 @@
 
 This tool converts JVM heap dumps (HPROF binary format) into Apache Parquet files, enabling columnar analytical processing of heap objects. It parses every object instance, class definition, primitive array, and object reference from a heap dump and exports them as typed Parquet columns — one file per Java class.
 
-It is also able to dump information about class to your terminal, if you want a more high level/fast look at things.
+It is also able to dump information classes on heap to your terminal, if you want a more high level/fast look at things.
 
-This is a very early stage of this project, and was made during a LinkedIn hackathon!
+This is an early stage project, and was made during a LinkedIn hackathon!  Any improvements or PR's are welcome!
 
 ## Dependencies
 
@@ -12,7 +12,7 @@ This project depends heavily on the work done by Marshall Pierce (thanks Marshal
 
 We depend on a fork of the `jvm-hprof` crate located here: https://bitbucket.org/ZacAttack/jvm-hprof-rs-li-hackweek/src/master/
 
-To build, you'll need to check out that repository at `../../bitbucket/jvm-hprof-rs-li-hackweek/` (relative to this project root), or update the path in `Cargo.toml`.
+To build, you'll need to check out that repository at `../../bitbucket/jvm-hprof-rs-li-hackweek/` (relative to this project root), or update the path in `Cargo.toml`. (I'm thinking we'll at some point just vendor this dependency).
 
 ## Build & Run
 
