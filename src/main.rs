@@ -21,6 +21,14 @@ fn main() {
             .about("Display the number of each of the top level hprof record types"))
         .subcommand(clap::Command::new("dump-objects-to-parquet")
             .about("Parses and dumps objects in the heap dump to parquet files")
+            .arg(
+                clap::Arg::new("flush-rows")
+                    .long("flush-rows")
+                    .value_name("N")
+                    .value_parser(clap::value_parser!(usize))
+                    .default_value("500000")
+                    .help("Number of rows to accumulate before flushing to disk (lower = less memory)"),
+            )
         );
     let matches = app.get_matches();
 
@@ -32,10 +40,13 @@ fn main() {
 
     let hprof = parse_hprof(&memmap[..]).unwrap();
 
-    matches.subcommand().map(|(subcommand, _)| match subcommand {
+    matches.subcommand().map(|(subcommand, sub_matches)| match subcommand {
         "dump-objects" => commands::dump_objects(&hprof),
         "count-records" => commands::count_records(&hprof),
-        "dump-objects-to-parquet" => commands::dump_objects_to_parquet(&hprof),
+        "dump-objects-to-parquet" => {
+            let flush_rows = *sub_matches.get_one::<usize>("flush-rows").unwrap();
+            commands::dump_objects_to_parquet(&hprof, flush_rows)
+        }
         _ => panic!("Unknown subcommand"),
     });
 }

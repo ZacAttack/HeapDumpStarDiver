@@ -11,7 +11,7 @@ use parquet::file::properties::WriterProperties;
 use crate::hprof_index::HprofIndex;
 use crate::util::generate_schema_from_type;
 
-const FLUSH_ROW_THRESHOLD: usize = 500_000;
+const DEFAULT_FLUSH_ROW_THRESHOLD: usize = 500_000;
 
 // ---------------------------------------------------------------------------
 // ParquetWriterPool — keeps one ArrowWriter<File> open per output file
@@ -361,7 +361,7 @@ fn write_static_fields(pool: &mut ParquetWriterPool, index: &HprofIndex) {
 // Main entry point
 // ---------------------------------------------------------------------------
 
-pub fn dump_objects_to_parquet(hprof: &Hprof) {
+pub fn dump_objects_to_parquet(hprof: &Hprof, flush_row_threshold: usize) {
     // Clean output directory so stale files from previous runs don't persist
     let _ = std::fs::remove_dir_all("parquet");
     std::fs::create_dir_all("parquet").unwrap();
@@ -601,7 +601,7 @@ pub fn dump_objects_to_parquet(hprof: &Hprof) {
                     }
 
                     // Periodic flush to keep memory bounded
-                    if rows_since_flush >= FLUSH_ROW_THRESHOLD {
+                    if rows_since_flush >= flush_row_threshold {
                         flush_instance_buffers(
                             &mut pool, &schemas, &mut class_field_columns,
                             &mut class_obj_ids, &index,
