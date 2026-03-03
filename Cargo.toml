@@ -10,3 +10,4 @@ jvm-hprof = { version = "0.1.0", path = "../../bitbucket/jvm-hprof-rs-li-hackwee
 memmap = "0.7.0"
 parquet = "54.0.0"
 clap = "4.5.27"
+rayon = "1.10"

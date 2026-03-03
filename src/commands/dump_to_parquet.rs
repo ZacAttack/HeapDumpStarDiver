@@ -8,10 +8,9 @@ use jvm_hprof::heap_dump::{FieldType, FieldValue, PrimitiveArrayType, SubRecord}
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use rayon::prelude::*;
 use crate::hprof_index::HprofIndex;
 use crate::util::generate_schema_from_type;
-
-const DEFAULT_FLUSH_ROW_THRESHOLD: usize = 500_000;
 
 // ---------------------------------------------------------------------------
 // ParquetWriterPool — keeps one ArrowWriter<File> open per output file
@@ -43,14 +42,16 @@ impl ParquetWriterPool {
     }
 
     fn close_all(self) {
-        for (_name, writer) in self.writers {
+        // Close writers in parallel — each close writes the Parquet footer
+        let writers: Vec<(String, ArrowWriter<std::fs::File>)> = self.writers.into_iter().collect();
+        writers.into_par_iter().for_each(|(_name, writer)| {
             writer.close().unwrap();
-        }
+        });
     }
 }
 
 // ---------------------------------------------------------------------------
-// ExtendedFieldValue & helpers (unchanged logic)
+// ExtendedFieldValue & helpers
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -59,6 +60,10 @@ enum ExtendedFieldValue {
     ObjectReference(Id),
     PrimitiveArrayReference(Id),
 }
+
+// Ensure ExtendedFieldValue can be sent across threads for parallel column building
+unsafe impl Send for ExtendedFieldValue {}
+unsafe impl Sync for ExtendedFieldValue {}
 
 /// Appends one instance's field values to the positional column vecs.
 /// `field_columns[i]` collects values for the i-th field descriptor.
@@ -97,9 +102,12 @@ fn add_instance_values(
     }
 }
 
-fn build_column(field_val_vec: &[ExtendedFieldValue], index: &HprofIndex) -> Arc<dyn Array> {
-    match field_val_vec[0] {
-        ExtendedFieldValue::ObjectReference(_) | ExtendedFieldValue::PrimitiveArrayReference(_) => {
+/// Build an Arrow column from buffered field values, using the schema's declared
+/// DataType to determine the output type. This prevents type mismatches between
+/// flush batches when a field's first element variant differs across flushes.
+fn build_column(field_val_vec: &[ExtendedFieldValue], index: &HprofIndex, expected_type: &DataType) -> Arc<dyn Array> {
+    match expected_type {
+        DataType::Struct(_) => {
             let id_vec = field_val_vec.iter().map(|v| match v {
                 ExtendedFieldValue::ObjectReference(val)
                 | ExtendedFieldValue::PrimitiveArrayReference(val) => val.id(),
@@ -113,67 +121,68 @@ fn build_column(field_val_vec: &[ExtendedFieldValue], index: &HprofIndex) -> Arc
                 _ => "null".to_string(),
             }).collect::<Vec<String>>();
             let id_array: Arc<dyn Array> = Arc::new(UInt64Array::from(id_vec));
-            let type_array: Arc<dyn Array> = Arc::new(arrow_array::StringArray::from(type_vec));
+            let type_array: Arc<dyn Array> = Arc::new(StringArray::from(type_vec));
             let struct_array = StructArray::from(vec![
                 (Arc::new(Field::new("id", DataType::UInt64, false)), id_array),
                 (Arc::new(Field::new("type", DataType::Utf8, false)), type_array),
             ]);
             Arc::new(struct_array)
         }
-        ExtendedFieldValue::FieldValue(FieldValue::ObjectId(_)) => {
-            Arc::new(UInt64Array::from(field_val_vec.iter().map(|v| match v {
-                ExtendedFieldValue::FieldValue(FieldValue::ObjectId(val)) => val.unwrap().id(),
-                _ => 0,
-            }).collect::<Vec<u64>>()))
-        }
-        ExtendedFieldValue::FieldValue(FieldValue::Int(_)) => {
+        DataType::Int32 => {
             Arc::new(Int32Array::from(field_val_vec.iter().map(|v| match v {
                 ExtendedFieldValue::FieldValue(FieldValue::Int(val)) => *val,
                 _ => 0,
             }).collect::<Vec<i32>>()))
         }
-        ExtendedFieldValue::FieldValue(FieldValue::Long(_)) => {
+        DataType::Int64 => {
             Arc::new(Int64Array::from(field_val_vec.iter().map(|v| match v {
                 ExtendedFieldValue::FieldValue(FieldValue::Long(val)) => *val,
                 _ => 0,
             }).collect::<Vec<i64>>()))
         }
-        ExtendedFieldValue::FieldValue(FieldValue::Boolean(_)) => {
+        DataType::Boolean => {
             Arc::new(BooleanArray::from(field_val_vec.iter().map(|v| match v {
                 ExtendedFieldValue::FieldValue(FieldValue::Boolean(val)) => *val,
                 _ => false,
             }).collect::<Vec<bool>>()))
         }
-        ExtendedFieldValue::FieldValue(FieldValue::Char(_)) => {
+        DataType::UInt16 => {
             Arc::new(UInt16Array::from(field_val_vec.iter().map(|v| match v {
                 ExtendedFieldValue::FieldValue(FieldValue::Char(val)) => *val as u16,
                 _ => 0,
             }).collect::<Vec<u16>>()))
         }
-        ExtendedFieldValue::FieldValue(FieldValue::Float(_)) => {
+        DataType::Float32 => {
             Arc::new(Float32Array::from(field_val_vec.iter().map(|v| match v {
                 ExtendedFieldValue::FieldValue(FieldValue::Float(val)) => *val,
                 _ => 0.0,
             }).collect::<Vec<f32>>()))
         }
-        ExtendedFieldValue::FieldValue(FieldValue::Double(_)) => {
+        DataType::Float64 => {
             Arc::new(Float64Array::from(field_val_vec.iter().map(|v| match v {
                 ExtendedFieldValue::FieldValue(FieldValue::Double(val)) => *val,
                 _ => 0.0,
             }).collect::<Vec<f64>>()))
         }
-        ExtendedFieldValue::FieldValue(FieldValue::Byte(_)) => {
+        DataType::Int8 => {
             Arc::new(Int8Array::from(field_val_vec.iter().map(|v| match v {
                 ExtendedFieldValue::FieldValue(FieldValue::Byte(val)) => *val,
                 _ => 0,
             }).collect::<Vec<i8>>()))
         }
-        ExtendedFieldValue::FieldValue(FieldValue::Short(_)) => {
+        DataType::Int16 => {
             Arc::new(Int16Array::from(field_val_vec.iter().map(|v| match v {
                 ExtendedFieldValue::FieldValue(FieldValue::Short(val)) => *val,
                 _ => 0,
             }).collect::<Vec<i16>>()))
         }
+        DataType::UInt64 => {
+            Arc::new(UInt64Array::from(field_val_vec.iter().map(|v| match v {
+                ExtendedFieldValue::FieldValue(FieldValue::ObjectId(val)) => val.unwrap().id(),
+                _ => 0,
+            }).collect::<Vec<u64>>()))
+        }
+        _ => panic!("Unsupported schema data type: {:?}", expected_type),
     }
 }
 
@@ -210,6 +219,9 @@ fn format_field_value(fv: &FieldValue) -> (String, String, u64, String) {
 // Flush helpers — drain accumulated buffers into the writer pool
 // ---------------------------------------------------------------------------
 
+/// Build RecordBatches in parallel using rayon, then write them sequentially.
+/// Column building (especially struct columns with type resolution) is the
+/// CPU-intensive part, while Parquet writes are I/O-bound and sequential per writer.
 fn flush_instance_buffers(
     pool: &mut ParquetWriterPool,
     schemas: &HashMap<Id, Schema>,
@@ -217,30 +229,66 @@ fn flush_instance_buffers(
     class_obj_ids: &mut HashMap<Id, Vec<u64>>,
     index: &HprofIndex,
 ) {
-    for (class_id, schema) in schemas.iter() {
-        let obj_ids = match class_obj_ids.get_mut(class_id) {
-            Some(v) if !v.is_empty() => v,
-            _ => continue,
-        };
-        let field_columns = class_field_columns.get_mut(class_id).unwrap();
+    // Collect classes that have data to flush
+    let class_ids_to_flush: Vec<Id> = schemas.keys()
+        .filter(|class_id| {
+            class_obj_ids.get(class_id).map_or(false, |v| !v.is_empty())
+        })
+        .cloned()
+        .collect();
 
-        let mut fields = vec![Field::new("obj_id", DataType::UInt64, false)];
-        fields.extend(schema.fields().iter().map(|f| f.as_ref().clone()));
-        let full_schema = Arc::new(Schema::new(fields));
+    if class_ids_to_flush.is_empty() {
+        return;
+    }
 
-        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(field_columns.len() + 1);
-        columns.push(Arc::new(UInt64Array::from(std::mem::take(obj_ids))));
-        columns.extend(field_columns.iter().map(|col| build_column(col, index)));
+    // Take ownership of buffers for parallel processing
+    let work_items: Vec<(Id, Vec<u64>, Vec<Vec<ExtendedFieldValue>>)> = class_ids_to_flush.iter()
+        .map(|class_id| {
+            let obj_ids = std::mem::take(class_obj_ids.get_mut(class_id).unwrap());
+            let columns = class_field_columns.get_mut(class_id).unwrap();
+            let taken_columns: Vec<Vec<ExtendedFieldValue>> = columns.iter_mut()
+                .map(|col| std::mem::take(col))
+                .collect();
+            (*class_id, obj_ids, taken_columns)
+        })
+        .collect();
 
-        let batch = RecordBatch::try_new(full_schema.clone(), columns).unwrap();
+    // Build RecordBatches in parallel (CPU-intensive column building + type resolution)
+    let batches: Vec<(String, Arc<Schema>, RecordBatch)> = work_items.into_par_iter()
+        .map(|(class_id, obj_ids, field_columns)| {
+            let schema = schemas.get(&class_id).unwrap();
 
-        let class_name = index.classes.get(class_id).unwrap().name;
-        pool.write_batch(class_name, full_schema, &batch);
+            let mut fields = vec![Field::new("obj_id", DataType::UInt64, false)];
+            fields.extend(schema.fields().iter().map(|f| f.as_ref().clone()));
+            let full_schema = Arc::new(Schema::new(fields));
 
-        // Clear column vecs for reuse (keep allocated capacity)
-        for col in field_columns.iter_mut() {
-            col.clear();
-        }
+            // Build columns in parallel within each class
+            let data_columns: Vec<Arc<dyn Array>> = field_columns.par_iter()
+                .zip(schema.fields().into_par_iter())
+                .map(|(col, field)| build_column(col, index, field.data_type()))
+                .collect();
+
+            let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(data_columns.len() + 1);
+            columns.push(Arc::new(UInt64Array::from(obj_ids)));
+            columns.extend(data_columns);
+
+            let batch = RecordBatch::try_new(full_schema.clone(), columns)
+                .unwrap_or_else(|e| {
+                    let class_name = index.classes.get(&class_id).map(|c| c.name).unwrap_or("unknown");
+                    panic!("RecordBatch creation failed for class '{}': {}", class_name, e);
+                });
+
+            let class_name = index.classes.get(&class_id).unwrap().name;
+            // Use class_id in the file key to disambiguate classes loaded by
+            // different classloaders that share the same fully-qualified name.
+            let file_key = format!("{}_{}", class_name, class_id);
+            (file_key, full_schema, batch)
+        })
+        .collect();
+
+    // Write batches sequentially (writers are not thread-safe)
+    for (file_key, full_schema, batch) in batches {
+        pool.write_batch(&file_key, full_schema, &batch);
     }
 }
 
@@ -667,6 +715,6 @@ pub fn dump_objects_to_parquet(hprof: &Hprof, flush_row_threshold: usize) {
         pool.write_batch("_gc_roots", schema, &batch);
     }
 
-    // Close all writers (writes parquet footers)
+    // Close all writers in parallel (writes parquet footers)
     pool.close_all();
 }
