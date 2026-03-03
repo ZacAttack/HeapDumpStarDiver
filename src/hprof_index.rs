@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use jvm_hprof::{Hprof, Id, LoadClass, RecordTag, EzClass, build_type_hierarchy_field_descriptors};
+use jvm_hprof::{Hprof, Id, LoadClass, Record, RecordTag, EzClass, build_type_hierarchy_field_descriptors};
 use jvm_hprof::heap_dump::{FieldDescriptor, PrimitiveArrayType, SubRecord};
 
 pub(crate) struct HprofIndex<'a> {
@@ -15,17 +15,26 @@ pub(crate) struct HprofIndex<'a> {
 
 impl<'a> HprofIndex<'a> {
     pub fn build(hprof: &'a Hprof<'a>) -> Self {
+        let (index, _) = Self::build_with_segments(hprof);
+        index
+    }
+
+    /// Build the index in a single sequential pass, also collecting segment Record handles
+    /// for later parallel processing. Record<'a> is Copy so this is cheap.
+    pub fn build_with_segments(hprof: &'a Hprof<'a>) -> (Self, Vec<Record<'a>>) {
         let mut utf8 = HashMap::new();
         let mut load_classes = HashMap::new();
         let mut classes: HashMap<Id, EzClass> = HashMap::new();
         let mut obj_id_to_class_obj_id: HashMap<Id, Id> = HashMap::new();
         let mut prim_array_obj_id_to_type = HashMap::new();
+        let mut segments: Vec<Record<'a>> = Vec::new();
 
         hprof
             .records_iter()
             .map(|r| r.unwrap())
             .for_each(|r| match r.tag() {
                 RecordTag::HeapDump | RecordTag::HeapDumpSegment => {
+                    segments.push(r);
                     let segment = r.as_heap_dump_segment().unwrap().unwrap();
                     for p in segment.sub_records() {
                         let s = p.unwrap();
@@ -64,6 +73,18 @@ impl<'a> HprofIndex<'a> {
                 _ => {}
             });
 
+        let index = Self::finish(utf8, load_classes, classes, obj_id_to_class_obj_id, prim_array_obj_id_to_type);
+        (index, segments)
+    }
+
+    /// Common finalization: build field descriptors and declaring class maps from the merged data.
+    fn finish(
+        utf8: HashMap<Id, &'a str>,
+        load_classes: HashMap<Id, LoadClass>,
+        classes: HashMap<Id, EzClass<'a>>,
+        obj_id_to_class_obj_id: HashMap<Id, Id>,
+        prim_array_obj_id_to_type: HashMap<Id, PrimitiveArrayType>,
+    ) -> Self {
         let class_instance_field_descriptors = build_type_hierarchy_field_descriptors(&classes);
 
         // Build parallel map of declaring class names for each field descriptor

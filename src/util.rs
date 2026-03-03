@@ -2,7 +2,7 @@ use std::collections;
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Fields, Schema};
 use jvm_hprof::{Hprof, Id};
-use jvm_hprof::heap_dump::{FieldDescriptor, FieldValue};
+use jvm_hprof::heap_dump::{FieldDescriptor, FieldType, FieldValue};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -120,6 +120,51 @@ pub fn generate_schema_from_type(
                 field_vec.push(Field::new(field_name, DataType::Int64, false));
             }
         }
+    }
+
+    Schema::new(field_vec)
+}
+
+/// Generate an Arrow schema from field descriptors and their types alone.
+/// No instance data required — the type mapping is deterministic from FieldType.
+pub fn generate_schema_from_descriptors(
+    field_descriptors: &[FieldDescriptor],
+    utf8: &collections::HashMap<Id, &str>,
+    declaring_classes: Option<&Vec<&str>>,
+) -> Schema {
+    let ref_struct_type = DataType::Struct(Fields::from(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("type", DataType::Utf8, false),
+    ]));
+
+    let mut field_vec: Vec<Field> = vec![];
+    let mut name_counts: collections::HashMap<&str, usize> = collections::HashMap::new();
+    for (i, fd) in field_descriptors.iter().enumerate() {
+        let base_name: &str = utf8.get(&fd.name_id()).unwrap_or_else(|| &MISSING_UTF8);
+        let count = name_counts.entry(base_name).or_insert(0);
+        let field_name = if *count == 0 {
+            base_name.to_string()
+        } else {
+            let class_prefix = declaring_classes
+                .and_then(|dc| dc.get(i))
+                .map(|c| c.rsplit('/').next().unwrap_or(c))
+                .unwrap_or("unknown");
+            format!("{}@{}", class_prefix, base_name)
+        };
+        *count += 1;
+
+        let data_type = match fd.field_type() {
+            FieldType::ObjectId => ref_struct_type.clone(),
+            FieldType::Boolean => DataType::Boolean,
+            FieldType::Char => DataType::UInt16,
+            FieldType::Float => DataType::Float32,
+            FieldType::Double => DataType::Float64,
+            FieldType::Byte => DataType::Int8,
+            FieldType::Short => DataType::Int16,
+            FieldType::Int => DataType::Int32,
+            FieldType::Long => DataType::Int64,
+        };
+        field_vec.push(Field::new(field_name, data_type, false));
     }
 
     Schema::new(field_vec)
