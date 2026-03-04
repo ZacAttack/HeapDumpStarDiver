@@ -13,44 +13,6 @@ use crate::hprof_index::HprofIndex;
 use crate::util::generate_schema_from_descriptors;
 
 // ---------------------------------------------------------------------------
-// ParquetWriterPool — keeps one ArrowWriter<File> open per output file
-// ---------------------------------------------------------------------------
-
-struct ParquetWriterPool {
-    writers: HashMap<String, ArrowWriter<std::fs::File>>,
-    props: WriterProperties,
-}
-
-impl ParquetWriterPool {
-    fn new() -> Self {
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-        ParquetWriterPool {
-            writers: HashMap::new(),
-            props,
-        }
-    }
-
-    fn write_batch(&mut self, filename_prefix: &str, schema: Arc<Schema>, batch: &RecordBatch) {
-        let writer = self.writers.entry(filename_prefix.to_string()).or_insert_with(|| {
-            let safe_name = filename_prefix.replace("/", ".");
-            let file = std::fs::File::create(format!("parquet/{}.parquet", safe_name)).unwrap();
-            ArrowWriter::try_new(file, schema.clone(), Some(self.props.clone())).unwrap()
-        });
-        writer.write(batch).unwrap();
-    }
-
-    fn close_all(self) {
-        // Close writers in parallel — each close writes the Parquet footer
-        let writers: Vec<(String, ArrowWriter<std::fs::File>)> = self.writers.into_iter().collect();
-        writers.into_par_iter().for_each(|(_name, writer)| {
-            writer.close().unwrap();
-        });
-    }
-}
-
-// ---------------------------------------------------------------------------
 // ExtendedFieldValue & helpers
 // ---------------------------------------------------------------------------
 
@@ -66,7 +28,6 @@ unsafe impl Send for ExtendedFieldValue {}
 unsafe impl Sync for ExtendedFieldValue {}
 
 /// Appends one instance's field values to the positional column vecs.
-/// `field_columns[i]` collects values for the i-th field descriptor.
 fn add_instance_values(
     hprof: &Hprof,
     field_columns: &mut Vec<Vec<ExtendedFieldValue>>,
@@ -88,7 +49,6 @@ fn add_instance_values(
                 } else if prim_array_obj_id_to_type.contains_key(&field_ref_id) {
                     field_columns[i].push(ExtendedFieldValue::PrimitiveArrayReference(field_ref_id));
                 } else {
-                    // Class reference or unresolvable — still record the id
                     field_columns[i].push(ExtendedFieldValue::ObjectReference(field_ref_id));
                 }
             }
@@ -103,8 +63,7 @@ fn add_instance_values(
 }
 
 /// Build an Arrow column from buffered field values, using the schema's declared
-/// DataType to determine the output type. This prevents type mismatches between
-/// flush batches when a field's first element variant differs across flushes.
+/// DataType to determine the output type.
 fn build_column(field_val_vec: &[ExtendedFieldValue], index: &HprofIndex, expected_type: &DataType) -> Arc<dyn Array> {
     match expected_type {
         DataType::Struct(_) => {
@@ -200,7 +159,6 @@ fn resolve_ref_type(id: Id, index: &HprofIndex) -> String {
 }
 
 fn format_field_value(fv: &FieldValue) -> (String, String, u64, String) {
-    // Returns (field_type, primitive_value, ref_id, ref_type_placeholder)
     match fv {
         FieldValue::ObjectId(Some(id)) => ("object".into(), String::new(), id.id(), String::new()),
         FieldValue::ObjectId(None) => ("object".into(), "null".into(), 0, "null".into()),
@@ -216,63 +174,52 @@ fn format_field_value(fv: &FieldValue) -> (String, String, u64, String) {
 }
 
 // ---------------------------------------------------------------------------
-// SegmentDataResult — thread-local extraction buffer (all Send-safe types)
+// Fully parallel segment processing: parse + build RecordBatches in rayon
 // ---------------------------------------------------------------------------
 
-/// Per-segment extraction result. Uses Vec-based buffers instead of Arrow's
-/// ListBuilder (which is !Send) so it can be produced inside rayon threads.
-struct SegmentDataResult {
-    /// Instances: class_obj_id → (obj_ids, field_columns)
-    instances: HashMap<Id, (Vec<u64>, Vec<Vec<ExtendedFieldValue>>)>,
-    /// Object arrays
-    oa_obj_ids: Vec<u64>,
-    oa_class_names: Vec<String>,
-    oa_elements: Vec<Vec<u64>>,
-    /// Primitive arrays — Vec of (obj_id, values)
-    bool_arrays: Vec<(u64, Vec<bool>)>,
-    byte_arrays: Vec<(u64, Vec<i8>)>,
-    char_arrays: Vec<(u64, Vec<u16>)>,
-    short_arrays: Vec<(u64, Vec<i16>)>,
-    int_arrays: Vec<(u64, Vec<i32>)>,
-    long_arrays: Vec<(u64, Vec<i64>)>,
-    float_arrays: Vec<(u64, Vec<f32>)>,
-    double_arrays: Vec<(u64, Vec<f64>)>,
-    /// GC roots: (type, obj_id, thread_serial, frame_index)
-    gc_roots: Vec<(String, u64, Option<u32>, Option<u32>)>,
-    /// Number of data rows collected (for flush threshold tracking)
-    row_count: usize,
+/// A ready-to-write batch: file key, schema, and the RecordBatch.
+struct WritableBatch {
+    file_key: String,
+    schema: Arc<Schema>,
+    batch: RecordBatch,
 }
 
-impl SegmentDataResult {
-    fn new() -> Self {
-        SegmentDataResult {
-            instances: HashMap::new(),
-            oa_obj_ids: Vec::new(),
-            oa_class_names: Vec::new(),
-            oa_elements: Vec::new(),
-            bool_arrays: Vec::new(),
-            byte_arrays: Vec::new(),
-            char_arrays: Vec::new(),
-            short_arrays: Vec::new(),
-            int_arrays: Vec::new(),
-            long_arrays: Vec::new(),
-            float_arrays: Vec::new(),
-            double_arrays: Vec::new(),
-            gc_roots: Vec::new(),
-            row_count: 0,
-        }
-    }
-}
+// WritableBatch contains RecordBatch (which is Send+Sync) and Strings/Arc — all Send.
+unsafe impl Send for WritableBatch {}
 
-/// Process a single HeapDump segment Record, extracting all data into a SegmentDataResult.
-fn process_segment_data<'a>(
+/// Process a single segment: parse sub-records, build Arrow arrays, and return
+/// ready-to-write RecordBatches. ALL CPU work happens here inside rayon.
+fn process_segment_to_batches<'a>(
     record: &Record<'a>,
     hprof: &Hprof,
     index: &HprofIndex,
-) -> SegmentDataResult {
-    let mut result = SegmentDataResult::new();
-    let segment = record.as_heap_dump_segment().unwrap().unwrap();
+    schemas: &HashMap<Id, Schema>,
+) -> Vec<WritableBatch> {
+    let mut batches = Vec::new();
 
+    // Temporary per-class accumulators for this segment
+    let mut instances: HashMap<Id, (Vec<u64>, Vec<Vec<ExtendedFieldValue>>)> = HashMap::new();
+
+    // Primitive array accumulators
+    let mut bool_arrays: Vec<(u64, Vec<bool>)> = Vec::new();
+    let mut byte_arrays: Vec<(u64, Vec<i8>)> = Vec::new();
+    let mut char_arrays: Vec<(u64, Vec<u16>)> = Vec::new();
+    let mut short_arrays: Vec<(u64, Vec<i16>)> = Vec::new();
+    let mut int_arrays: Vec<(u64, Vec<i32>)> = Vec::new();
+    let mut long_arrays: Vec<(u64, Vec<i64>)> = Vec::new();
+    let mut float_arrays: Vec<(u64, Vec<f32>)> = Vec::new();
+    let mut double_arrays: Vec<(u64, Vec<f64>)> = Vec::new();
+
+    // Object array accumulators
+    let mut oa_obj_ids: Vec<u64> = Vec::new();
+    let mut oa_class_names: Vec<String> = Vec::new();
+    let mut oa_elements: Vec<Vec<u64>> = Vec::new();
+
+    // GC root accumulators
+    let mut gc_roots: Vec<(String, u64, Option<u32>, Option<u32>)> = Vec::new();
+
+    // --- Parse sub-records ---
+    let segment = record.as_heap_dump_segment().unwrap().unwrap();
     for p in segment.sub_records() {
         let s = p.unwrap();
         match s {
@@ -281,10 +228,13 @@ fn process_segment_data<'a>(
                     .get(&instance.class_obj_id())
                 {
                     Some(fd) => fd,
-                    None => continue, // skip instances whose class wasn't indexed
+                    None => continue,
                 };
+                if !schemas.contains_key(&instance.class_obj_id()) {
+                    continue;
+                }
 
-                let entry = result.instances
+                let entry = instances
                     .entry(instance.class_obj_id())
                     .or_insert_with(|| {
                         let columns: Vec<Vec<ExtendedFieldValue>> =
@@ -293,186 +243,146 @@ fn process_segment_data<'a>(
                     });
 
                 entry.0.push(instance.obj_id().id());
-
                 add_instance_values(
-                    hprof,
-                    &mut entry.1,
-                    instance.fields(),
-                    field_descriptors,
-                    &index.obj_id_to_class_obj_id,
-                    &index.prim_array_obj_id_to_type,
+                    hprof, &mut entry.1, instance.fields(), field_descriptors,
+                    &index.obj_id_to_class_obj_id, &index.prim_array_obj_id_to_type,
                 );
-
-                result.row_count += 1;
             }
             SubRecord::PrimitiveArray(pa) => {
                 let obj_id = pa.obj_id().id();
                 match pa.primitive_type() {
                     PrimitiveArrayType::Boolean => {
-                        let vals: Vec<bool> = pa.booleans().unwrap().map(|v| v.unwrap()).collect();
-                        result.bool_arrays.push((obj_id, vals));
+                        bool_arrays.push((obj_id, pa.booleans().unwrap().map(|v| v.unwrap()).collect()));
                     }
                     PrimitiveArrayType::Byte => {
-                        let vals: Vec<i8> = pa.bytes().unwrap().map(|v| v.unwrap()).collect();
-                        result.byte_arrays.push((obj_id, vals));
+                        byte_arrays.push((obj_id, pa.bytes().unwrap().map(|v| v.unwrap()).collect()));
                     }
                     PrimitiveArrayType::Char => {
-                        let vals: Vec<u16> = pa.chars().unwrap().map(|v| v.unwrap() as u16).collect();
-                        result.char_arrays.push((obj_id, vals));
+                        char_arrays.push((obj_id, pa.chars().unwrap().map(|v| v.unwrap() as u16).collect()));
                     }
                     PrimitiveArrayType::Short => {
-                        let vals: Vec<i16> = pa.shorts().unwrap().map(|v| v.unwrap()).collect();
-                        result.short_arrays.push((obj_id, vals));
+                        short_arrays.push((obj_id, pa.shorts().unwrap().map(|v| v.unwrap()).collect()));
                     }
                     PrimitiveArrayType::Int => {
-                        let vals: Vec<i32> = pa.ints().unwrap().map(|v| v.unwrap()).collect();
-                        result.int_arrays.push((obj_id, vals));
+                        int_arrays.push((obj_id, pa.ints().unwrap().map(|v| v.unwrap()).collect()));
                     }
                     PrimitiveArrayType::Long => {
-                        let vals: Vec<i64> = pa.longs().unwrap().map(|v| v.unwrap()).collect();
-                        result.long_arrays.push((obj_id, vals));
+                        long_arrays.push((obj_id, pa.longs().unwrap().map(|v| v.unwrap()).collect()));
                     }
                     PrimitiveArrayType::Float => {
-                        let vals: Vec<f32> = pa.floats().unwrap().map(|v| v.unwrap()).collect();
-                        result.float_arrays.push((obj_id, vals));
+                        float_arrays.push((obj_id, pa.floats().unwrap().map(|v| v.unwrap()).collect()));
                     }
                     PrimitiveArrayType::Double => {
-                        let vals: Vec<f64> = pa.doubles().unwrap().map(|v| v.unwrap()).collect();
-                        result.double_arrays.push((obj_id, vals));
+                        double_arrays.push((obj_id, pa.doubles().unwrap().map(|v| v.unwrap()).collect()));
                     }
                 }
-                result.row_count += 1;
             }
             SubRecord::ObjectArray(oa) => {
-                result.oa_obj_ids.push(oa.obj_id().id());
-
-                let class_name = index.classes.get(&oa.array_class_obj_id())
-                    .map(|c| c.name.to_string())
-                    .unwrap_or_else(|| "(unresolved)".to_string());
-                result.oa_class_names.push(class_name);
-
-                let elems: Vec<u64> = oa.elements(hprof.header().id_size())
-                    .map(|elem| match elem.unwrap() {
-                        Some(id) => id.id(),
-                        None => 0,
-                    })
-                    .collect();
-                result.oa_elements.push(elems);
-
-                result.row_count += 1;
+                oa_obj_ids.push(oa.obj_id().id());
+                oa_class_names.push(
+                    index.classes.get(&oa.array_class_obj_id())
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_else(|| "(unresolved)".to_string())
+                );
+                oa_elements.push(
+                    oa.elements(hprof.header().id_size())
+                        .map(|elem| match elem.unwrap() {
+                            Some(id) => id.id(),
+                            None => 0,
+                        })
+                        .collect()
+                );
             }
             SubRecord::GcRootUnknown(r) => {
-                result.gc_roots.push(("Unknown".into(), r.obj_id().id(), None, None));
+                gc_roots.push(("Unknown".into(), r.obj_id().id(), None, None));
             }
             SubRecord::GcRootThreadObj(r) => {
-                result.gc_roots.push(("ThreadObj".into(), r.thread_obj_id().map(|id| id.id()).unwrap_or(0), Some(r.thread_serial().num()), None));
+                gc_roots.push(("ThreadObj".into(), r.thread_obj_id().map(|id| id.id()).unwrap_or(0), Some(r.thread_serial().num()), None));
             }
             SubRecord::GcRootJniGlobal(r) => {
-                result.gc_roots.push(("JniGlobal".into(), r.obj_id().id(), None, None));
+                gc_roots.push(("JniGlobal".into(), r.obj_id().id(), None, None));
             }
             SubRecord::GcRootJniLocalRef(r) => {
-                result.gc_roots.push(("JniLocal".into(), r.obj_id().id(), Some(r.thread_serial().num()), r.frame_index()));
+                gc_roots.push(("JniLocal".into(), r.obj_id().id(), Some(r.thread_serial().num()), r.frame_index()));
             }
             SubRecord::GcRootJavaStackFrame(r) => {
-                result.gc_roots.push(("JavaStackFrame".into(), r.obj_id().id(), Some(r.thread_serial().num()), r.frame_index()));
+                gc_roots.push(("JavaStackFrame".into(), r.obj_id().id(), Some(r.thread_serial().num()), r.frame_index()));
             }
             SubRecord::GcRootNativeStack(r) => {
-                result.gc_roots.push(("NativeStack".into(), r.obj_id().id(), Some(r.thread_serial().num()), None));
+                gc_roots.push(("NativeStack".into(), r.obj_id().id(), Some(r.thread_serial().num()), None));
             }
             SubRecord::GcRootSystemClass(r) => {
-                result.gc_roots.push(("SystemClass".into(), r.obj_id().id(), None, None));
+                gc_roots.push(("SystemClass".into(), r.obj_id().id(), None, None));
             }
             SubRecord::GcRootThreadBlock(r) => {
-                result.gc_roots.push(("ThreadBlock".into(), r.obj_id().id(), Some(r.thread_serial().num()), None));
+                gc_roots.push(("ThreadBlock".into(), r.obj_id().id(), Some(r.thread_serial().num()), None));
             }
             SubRecord::GcRootBusyMonitor(r) => {
-                result.gc_roots.push(("BusyMonitor".into(), r.obj_id().id(), None, None));
+                gc_roots.push(("BusyMonitor".into(), r.obj_id().id(), None, None));
             }
             _ => {}
         }
     }
 
-    result
-}
+    // --- Build RecordBatches (all CPU work, still inside rayon task) ---
 
-// ---------------------------------------------------------------------------
-// Merge helpers — fold SegmentDataResult into main accumulators
-// ---------------------------------------------------------------------------
+    // Instance batches per class
+    for (class_id, (obj_ids, field_columns)) in instances {
+        let schema = match schemas.get(&class_id) {
+            Some(s) => s,
+            None => continue,
+        };
 
-/// Flush a SegmentDataResult directly to the writer pool — no intermediate merge step.
-/// Instance columns are built and written per-class. Primitive/object arrays use ListBuilder
-/// (built on the main thread) and written immediately.
-fn flush_segment_data(
-    seg: SegmentDataResult,
-    pool: &mut ParquetWriterPool,
-    schemas: &HashMap<Id, Schema>,
-    index: &HprofIndex,
-) {
-    // Flush instances per-class
-    let work_items: Vec<(Id, Vec<u64>, Vec<Vec<ExtendedFieldValue>>)> = seg.instances.into_iter()
-        .filter(|(cid, _)| schemas.contains_key(cid))
-        .map(|(cid, (obj_ids, field_cols))| (cid, obj_ids, field_cols))
-        .collect();
+        let mut fields = vec![Field::new("obj_id", DataType::UInt64, false)];
+        fields.extend(schema.fields().iter().map(|f| f.as_ref().clone()));
+        let full_schema = Arc::new(Schema::new(fields));
 
-    if !work_items.is_empty() {
-        let batches: Vec<(String, Arc<Schema>, RecordBatch)> = work_items.into_par_iter()
-            .map(|(class_id, obj_ids, field_columns)| {
-                let schema = schemas.get(&class_id).unwrap();
-                let mut fields = vec![Field::new("obj_id", DataType::UInt64, false)];
-                fields.extend(schema.fields().iter().map(|f| f.as_ref().clone()));
-                let full_schema = Arc::new(Schema::new(fields));
-
-                let data_columns: Vec<Arc<dyn Array>> = field_columns.par_iter()
-                    .zip(schema.fields().into_par_iter())
-                    .map(|(col, field)| build_column(col, index, field.data_type()))
-                    .collect();
-
-                let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(data_columns.len() + 1);
-                columns.push(Arc::new(UInt64Array::from(obj_ids)));
-                columns.extend(data_columns);
-
-                let batch = RecordBatch::try_new(full_schema.clone(), columns)
-                    .unwrap_or_else(|e| {
-                        let class_name = index.classes.get(&class_id).map(|c| c.name).unwrap_or("unknown");
-                        panic!("RecordBatch creation failed for class '{}': {}", class_name, e);
-                    });
-
-                let class_name = index.classes.get(&class_id).unwrap().name;
-                let file_key = format!("{}_{}", class_name, class_id);
-                (file_key, full_schema, batch)
-            })
+        let data_columns: Vec<Arc<dyn Array>> = field_columns.iter()
+            .zip(schema.fields().iter())
+            .map(|(col, field)| build_column(col, index, field.data_type()))
             .collect();
 
-        for (file_key, full_schema, batch) in batches {
-            pool.write_batch(&file_key, full_schema, &batch);
-        }
+        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(data_columns.len() + 1);
+        columns.push(Arc::new(UInt64Array::from(obj_ids)));
+        columns.extend(data_columns);
+
+        let batch = RecordBatch::try_new(full_schema.clone(), columns)
+            .unwrap_or_else(|e| {
+                let class_name = index.classes.get(&class_id).map(|c| c.name).unwrap_or("unknown");
+                panic!("RecordBatch creation failed for class '{}': {}", class_name, e);
+            });
+
+        let class_name = index.classes.get(&class_id).unwrap().name;
+        let file_key = format!("{}_{}", class_name, class_id);
+        batches.push(WritableBatch { file_key, schema: full_schema, batch });
     }
 
-    // Flush object arrays
-    if !seg.oa_obj_ids.is_empty() {
+    // Object array batch
+    if !oa_obj_ids.is_empty() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("obj_id", DataType::UInt64, false),
             Field::new("class_name", DataType::Utf8, false),
             Field::new("elements", DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))), false),
         ]));
-        let mut oa_elements = ListBuilder::new(UInt64Builder::new());
-        for elems in &seg.oa_elements {
-            for e in elems { oa_elements.values().append_value(*e); }
-            oa_elements.append(true);
+        // ListBuilder created and consumed within this task — never sent across threads
+        let mut list_builder = ListBuilder::new(UInt64Builder::new());
+        for elems in &oa_elements {
+            for e in elems { list_builder.values().append_value(*e); }
+            list_builder.append(true);
         }
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(UInt64Array::from(seg.oa_obj_ids)) as Arc<dyn Array>,
-                Arc::new(StringArray::from(seg.oa_class_names)) as Arc<dyn Array>,
-                Arc::new(oa_elements.finish()) as Arc<dyn Array>,
+                Arc::new(UInt64Array::from(oa_obj_ids)) as Arc<dyn Array>,
+                Arc::new(StringArray::from(oa_class_names)) as Arc<dyn Array>,
+                Arc::new(list_builder.finish()) as Arc<dyn Array>,
             ],
         ).unwrap();
-        pool.write_batch("_object_arrays", schema, &batch);
+        batches.push(WritableBatch { file_key: "_object_arrays".into(), schema, batch });
     }
 
-    // Flush primitive arrays
-    macro_rules! flush_seg_prim {
+    // Primitive array batches
+    macro_rules! build_prim_batch {
         ($arrays:expr, $name:expr, $inner_type:expr, $builder_type:ident) => {
             if !$arrays.is_empty() {
                 let mut obj_ids = Vec::with_capacity($arrays.len());
@@ -493,27 +403,27 @@ fn flush_segment_data(
                         Arc::new(list_builder.finish()) as Arc<dyn Array>,
                     ],
                 ).unwrap();
-                pool.write_batch($name, schema, &batch);
+                batches.push(WritableBatch { file_key: $name.into(), schema, batch });
             }
         };
     }
 
-    flush_seg_prim!(seg.bool_arrays, "_primitive_arrays_boolean", DataType::Boolean, BooleanBuilder);
-    flush_seg_prim!(seg.byte_arrays, "_primitive_arrays_byte", DataType::Int8, Int8Builder);
-    flush_seg_prim!(seg.char_arrays, "_primitive_arrays_char", DataType::UInt16, UInt16Builder);
-    flush_seg_prim!(seg.short_arrays, "_primitive_arrays_short", DataType::Int16, Int16Builder);
-    flush_seg_prim!(seg.int_arrays, "_primitive_arrays_int", DataType::Int32, Int32Builder);
-    flush_seg_prim!(seg.long_arrays, "_primitive_arrays_long", DataType::Int64, Int64Builder);
-    flush_seg_prim!(seg.float_arrays, "_primitive_arrays_float", DataType::Float32, Float32Builder);
-    flush_seg_prim!(seg.double_arrays, "_primitive_arrays_double", DataType::Float64, Float64Builder);
+    build_prim_batch!(bool_arrays, "_primitive_arrays_boolean", DataType::Boolean, BooleanBuilder);
+    build_prim_batch!(byte_arrays, "_primitive_arrays_byte", DataType::Int8, Int8Builder);
+    build_prim_batch!(char_arrays, "_primitive_arrays_char", DataType::UInt16, UInt16Builder);
+    build_prim_batch!(short_arrays, "_primitive_arrays_short", DataType::Int16, Int16Builder);
+    build_prim_batch!(int_arrays, "_primitive_arrays_int", DataType::Int32, Int32Builder);
+    build_prim_batch!(long_arrays, "_primitive_arrays_long", DataType::Int64, Int64Builder);
+    build_prim_batch!(float_arrays, "_primitive_arrays_float", DataType::Float32, Float32Builder);
+    build_prim_batch!(double_arrays, "_primitive_arrays_double", DataType::Float64, Float64Builder);
 
-    // Flush GC roots
-    if !seg.gc_roots.is_empty() {
-        let mut types = Vec::with_capacity(seg.gc_roots.len());
-        let mut obj_ids = Vec::with_capacity(seg.gc_roots.len());
-        let mut thread_serials = Vec::with_capacity(seg.gc_roots.len());
-        let mut frame_indexes = Vec::with_capacity(seg.gc_roots.len());
-        for (rt, oid, ts, fi) in seg.gc_roots {
+    // GC root batch
+    if !gc_roots.is_empty() {
+        let mut types = Vec::with_capacity(gc_roots.len());
+        let mut obj_ids = Vec::with_capacity(gc_roots.len());
+        let mut thread_serials = Vec::with_capacity(gc_roots.len());
+        let mut frame_indexes = Vec::with_capacity(gc_roots.len());
+        for (rt, oid, ts, fi) in gc_roots {
             types.push(rt);
             obj_ids.push(oid);
             thread_serials.push(ts);
@@ -534,12 +444,16 @@ fn flush_segment_data(
                 Arc::new(UInt32Array::from(frame_indexes)) as Arc<dyn Array>,
             ],
         ).unwrap();
-        pool.write_batch("_gc_roots", schema, &batch);
+        batches.push(WritableBatch { file_key: "_gc_roots".into(), schema, batch });
     }
+
+    batches
 }
 
-/// Generate Arrow schemas for all classes from their field descriptors.
-/// No instance data needed — the type mapping is deterministic from FieldType.
+// ---------------------------------------------------------------------------
+// Schema generation
+// ---------------------------------------------------------------------------
+
 fn generate_all_schemas(index: &HprofIndex) -> HashMap<Id, Schema> {
     index.class_instance_field_descriptors.iter()
         .map(|(class_id, field_descriptors)| {
@@ -554,10 +468,10 @@ fn generate_all_schemas(index: &HprofIndex) -> HashMap<Id, Schema> {
 }
 
 // ---------------------------------------------------------------------------
-// Flush helpers
+// Static fields writer
 // ---------------------------------------------------------------------------
 
-fn write_static_fields(pool: &mut ParquetWriterPool, index: &HprofIndex) {
+fn build_static_fields_batch(index: &HprofIndex) -> Option<WritableBatch> {
     let mut class_obj_ids: Vec<u64> = Vec::new();
     let mut class_names: Vec<String> = Vec::new();
     let mut field_names: Vec<String> = Vec::new();
@@ -595,7 +509,7 @@ fn write_static_fields(pool: &mut ParquetWriterPool, index: &HprofIndex) {
     }
 
     if class_obj_ids.is_empty() {
-        return;
+        return None;
     }
 
     let schema = Arc::new(Schema::new(vec![
@@ -621,58 +535,111 @@ fn write_static_fields(pool: &mut ParquetWriterPool, index: &HprofIndex) {
         ],
     ).unwrap();
 
-    pool.write_batch("_static_fields", schema, &batch);
+    Some(WritableBatch { file_key: "_static_fields".into(), schema, batch })
 }
 
 // ---------------------------------------------------------------------------
-// Main entry point — Three-phase parallel pipeline
+// ParquetWriterPool — keeps one ArrowWriter<File> open per output file
+// ---------------------------------------------------------------------------
+
+struct ParquetWriterPool {
+    writers: HashMap<String, ArrowWriter<std::fs::File>>,
+    props: WriterProperties,
+}
+
+impl ParquetWriterPool {
+    fn new() -> Self {
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        ParquetWriterPool {
+            writers: HashMap::new(),
+            props,
+        }
+    }
+
+    fn write_batch(&mut self, file_key: &str, schema: Arc<Schema>, batch: &RecordBatch) {
+        let writer = self.writers.entry(file_key.to_string()).or_insert_with(|| {
+            let safe_name = file_key.replace("/", ".");
+            let file = std::fs::File::create(format!("parquet/{}.parquet", safe_name)).unwrap();
+            ArrowWriter::try_new(file, schema.clone(), Some(self.props.clone())).unwrap()
+        });
+        writer.write(batch).unwrap();
+    }
+
+    fn close_all(self) {
+        let writers: Vec<(String, ArrowWriter<std::fs::File>)> = self.writers.into_iter().collect();
+        writers.into_par_iter().for_each(|(_name, writer)| {
+            writer.close().unwrap();
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main entry point
 // ---------------------------------------------------------------------------
 
 pub fn dump_objects_to_parquet(hprof: &Hprof, _flush_row_threshold: usize) {
+    use std::time::Instant;
+
     // Clean output directory so stale files from previous runs don't persist
     let _ = std::fs::remove_dir_all("parquet");
     std::fs::create_dir_all("parquet").unwrap();
 
     // -----------------------------------------------------------------------
-    // Pass 1: Sequential index build + collect segment handles (single pass)
+    // Pass 1: Parallel index build + collect segment handles
     // -----------------------------------------------------------------------
+    let t0 = Instant::now();
     let (index, segments) = HprofIndex::build_with_segments(hprof);
+    let pass1_dur = t0.elapsed();
 
-    println!("Pass 1 complete: {} classes, {} obj mappings, {} segments",
+    println!("Pass 1 complete in {:.1}s: {} classes, {} obj mappings, {} segments",
+        pass1_dur.as_secs_f64(),
         index.classes.len(), index.obj_id_to_class_obj_id.len(), segments.len());
 
     // Generate schemas from field descriptors (no file scan needed)
     let schemas = generate_all_schemas(&index);
-
     println!("{} schemas generated", schemas.len());
 
     // -----------------------------------------------------------------------
-    // Pass 2: Parallel data extraction → direct flush (no merge step)
+    // Pass 2: Parallel compute, sequential write (one file per class)
     // -----------------------------------------------------------------------
-    // Each batch of segments is processed in parallel, then each segment's
-    // data is flushed directly to parquet. This eliminates the sequential
-    // merge bottleneck — no shared accumulators.
+    let t1 = Instant::now();
     let mut pool = ParquetWriterPool::new();
+    let mut total_compute = std::time::Duration::ZERO;
+    let mut total_write = std::time::Duration::ZERO;
+    let mut total_batches = 0usize;
 
-    // Process segments in batches to control memory usage.
-    let batch_size = segments.len().min(256).max(1);
-    for batch in segments.chunks(batch_size) {
-        // Process this batch of segments in parallel
-        let segment_results: Vec<SegmentDataResult> = batch.par_iter()
-            .map(|record| process_segment_data(record, hprof, &index))
+    let chunk_size = 1024;
+    for chunk in segments.chunks(chunk_size) {
+        let tc = Instant::now();
+        let all_batches: Vec<Vec<WritableBatch>> = chunk.par_iter()
+            .map(|record| process_segment_to_batches(record, hprof, &index, &schemas))
             .collect();
+        total_compute += tc.elapsed();
 
-        // Flush each segment's results directly (no merge into shared accumulators)
-        for seg in segment_results {
-            flush_segment_data(seg, &mut pool, &schemas, &index);
+        let tw = Instant::now();
+        for segment_batches in all_batches {
+            for wb in segment_batches {
+                total_batches += 1;
+                pool.write_batch(&wb.file_key, wb.schema, &wb.batch);
+            }
         }
+        total_write += tw.elapsed();
     }
 
-    println!("Pass 2 complete: extracted data from {} segments", segments.len());
+    // Write static fields
+    if let Some(sb) = build_static_fields_batch(&index) {
+        pool.write_batch(&sb.file_key, sb.schema.clone(), &sb.batch);
+    }
 
-    // Write static fields (small, one-shot)
-    write_static_fields(&mut pool, &index);
+    let pass2_dur = t1.elapsed();
+    println!("Pass 2 in {:.1}s: compute={:.1}s, write={:.1}s, {} batches",
+        pass2_dur.as_secs_f64(), total_compute.as_secs_f64(),
+        total_write.as_secs_f64(), total_batches);
 
     // Close all writers in parallel (writes parquet footers)
+    let t2 = Instant::now();
     pool.close_all();
+    println!("Writers closed in {:.1}s", t2.elapsed().as_secs_f64());
 }
