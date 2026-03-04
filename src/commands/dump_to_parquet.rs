@@ -539,37 +539,54 @@ fn build_static_fields_batch(index: &HprofIndex) -> Option<WritableBatch> {
 }
 
 // ---------------------------------------------------------------------------
-// ParquetWriterPool — keeps one ArrowWriter<File> open per output file
+// SharedWriterPool — thread-safe pool with per-writer Mutex locking
 // ---------------------------------------------------------------------------
+// Outer Mutex protects the HashMap for lazy writer creation.
+// Inner Mutex protects individual ArrowWriters so multiple threads can write
+// to different files concurrently — they only block when two threads need
+// the same file.
 
-struct ParquetWriterPool {
-    writers: HashMap<String, ArrowWriter<std::fs::File>>,
+use std::sync::{Arc as StdArc, Mutex};
+
+struct SharedWriterPool {
+    writers: Mutex<HashMap<String, StdArc<Mutex<ArrowWriter<std::fs::File>>>>>,
     props: WriterProperties,
 }
 
-impl ParquetWriterPool {
+impl SharedWriterPool {
     fn new() -> Self {
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
             .build();
-        ParquetWriterPool {
-            writers: HashMap::new(),
+        SharedWriterPool {
+            writers: Mutex::new(HashMap::new()),
             props,
         }
     }
 
-    fn write_batch(&mut self, file_key: &str, schema: Arc<Schema>, batch: &RecordBatch) {
-        let writer = self.writers.entry(file_key.to_string()).or_insert_with(|| {
-            let safe_name = file_key.replace("/", ".");
-            let file = std::fs::File::create(format!("parquet/{}.parquet", safe_name)).unwrap();
-            ArrowWriter::try_new(file, schema.clone(), Some(self.props.clone())).unwrap()
-        });
-        writer.write(batch).unwrap();
+    fn write_batch(&self, file_key: &str, schema: Arc<Schema>, batch: &RecordBatch) {
+        // Hold outer lock briefly: get or create the writer, clone the Arc
+        let writer_arc = {
+            let mut map = self.writers.lock().unwrap();
+            map.entry(file_key.to_string()).or_insert_with(|| {
+                let safe_name = file_key.replace("/", ".");
+                let file = std::fs::File::create(format!("parquet/{}.parquet", safe_name)).unwrap();
+                StdArc::new(Mutex::new(
+                    ArrowWriter::try_new(file, schema, Some(self.props.clone())).unwrap()
+                ))
+            }).clone()
+        };
+        // Per-writer lock: encoding + compression happens here, other files unblocked
+        writer_arc.lock().unwrap().write(batch).unwrap();
     }
 
     fn close_all(self) {
-        let writers: Vec<(String, ArrowWriter<std::fs::File>)> = self.writers.into_iter().collect();
-        writers.into_par_iter().for_each(|(_name, writer)| {
+        let map = self.writers.into_inner().unwrap();
+        let writers: Vec<_> = map.into_iter().collect();
+        writers.into_par_iter().for_each(|(_name, writer_arc)| {
+            let writer = StdArc::try_unwrap(writer_arc)
+                .expect("writer Arc still has multiple owners")
+                .into_inner().unwrap();
             writer.close().unwrap();
         });
     }
@@ -602,31 +619,20 @@ pub fn dump_objects_to_parquet(hprof: &Hprof, _flush_row_threshold: usize) {
     println!("{} schemas generated", schemas.len());
 
     // -----------------------------------------------------------------------
-    // Pass 2: Parallel compute, sequential write (one file per class)
+    // Pass 2: Fully parallel compute + write (one file per class)
     // -----------------------------------------------------------------------
+    // Each rayon thread processes a segment, builds RecordBatches, and writes
+    // them directly to the shared writer pool. Different files are written
+    // concurrently; same-file access is serialized by per-writer Mutexes.
     let t1 = Instant::now();
-    let mut pool = ParquetWriterPool::new();
-    let mut total_compute = std::time::Duration::ZERO;
-    let mut total_write = std::time::Duration::ZERO;
-    let mut total_batches = 0usize;
+    let pool = SharedWriterPool::new();
 
-    let chunk_size = 1024;
-    for chunk in segments.chunks(chunk_size) {
-        let tc = Instant::now();
-        let all_batches: Vec<Vec<WritableBatch>> = chunk.par_iter()
-            .map(|record| process_segment_to_batches(record, hprof, &index, &schemas))
-            .collect();
-        total_compute += tc.elapsed();
-
-        let tw = Instant::now();
-        for segment_batches in all_batches {
-            for wb in segment_batches {
-                total_batches += 1;
-                pool.write_batch(&wb.file_key, wb.schema, &wb.batch);
-            }
+    segments.par_iter().for_each(|record| {
+        let batches = process_segment_to_batches(record, hprof, &index, &schemas);
+        for wb in batches {
+            pool.write_batch(&wb.file_key, wb.schema, &wb.batch);
         }
-        total_write += tw.elapsed();
-    }
+    });
 
     // Write static fields
     if let Some(sb) = build_static_fields_batch(&index) {
@@ -634,9 +640,7 @@ pub fn dump_objects_to_parquet(hprof: &Hprof, _flush_row_threshold: usize) {
     }
 
     let pass2_dur = t1.elapsed();
-    println!("Pass 2 in {:.1}s: compute={:.1}s, write={:.1}s, {} batches",
-        pass2_dur.as_secs_f64(), total_compute.as_secs_f64(),
-        total_write.as_secs_f64(), total_batches);
+    println!("Pass 2 in {:.1}s", pass2_dur.as_secs_f64());
 
     // Close all writers in parallel (writes parquet footers)
     let t2 = Instant::now();
