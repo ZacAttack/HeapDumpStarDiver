@@ -3,6 +3,7 @@ use std::sync::Arc;
 use arrow_array::{Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, StructArray, UInt16Array, UInt32Array, UInt64Array};
 use arrow_array::builder::{ListBuilder, BooleanBuilder, Int8Builder, UInt16Builder, Int16Builder, Int32Builder, Int64Builder, Float32Builder, Float64Builder, UInt64Builder};
 use arrow_schema::{DataType, Field, Schema};
+use dashmap::DashMap;
 use jvm_hprof::{Hprof, Id, Record};
 use jvm_hprof::heap_dump::{FieldType, FieldValue, PrimitiveArrayType, SubRecord};
 use parquet::arrow::ArrowWriter;
@@ -19,8 +20,8 @@ use crate::util::generate_schema_from_descriptors;
 #[derive(Debug)]
 enum ExtendedFieldValue {
     FieldValue(FieldValue),
-    ObjectReference(Id),
-    PrimitiveArrayReference(Id),
+    /// Any object reference (instance, array, class, or null). Type resolved at build time.
+    Reference(Id),
 }
 
 // Ensure ExtendedFieldValue can be sent across threads for parallel column building
@@ -28,13 +29,13 @@ unsafe impl Send for ExtendedFieldValue {}
 unsafe impl Sync for ExtendedFieldValue {}
 
 /// Appends one instance's field values to the positional column vecs.
+/// Reference classification (instance vs prim array) is deferred to build_column
+/// to avoid redundant DashMap lookups during the hot parse loop.
 fn add_instance_values(
     hprof: &Hprof,
     field_columns: &mut Vec<Vec<ExtendedFieldValue>>,
     mut field_val_input: &[u8],
     field_descriptors: &[jvm_hprof::heap_dump::FieldDescriptor],
-    obj_id_to_class_obj_id: &HashMap<Id, Id>,
-    prim_array_obj_id_to_type: &HashMap<Id, PrimitiveArrayType>,
 ) {
     for (i, fd) in field_descriptors.iter().enumerate() {
         let (input, field_val) = fd
@@ -44,16 +45,10 @@ fn add_instance_values(
         field_val_input = input;
         match field_val {
             FieldValue::ObjectId(Some(field_ref_id)) => {
-                if obj_id_to_class_obj_id.contains_key(&field_ref_id) {
-                    field_columns[i].push(ExtendedFieldValue::ObjectReference(field_ref_id));
-                } else if prim_array_obj_id_to_type.contains_key(&field_ref_id) {
-                    field_columns[i].push(ExtendedFieldValue::PrimitiveArrayReference(field_ref_id));
-                } else {
-                    field_columns[i].push(ExtendedFieldValue::ObjectReference(field_ref_id));
-                }
+                field_columns[i].push(ExtendedFieldValue::Reference(field_ref_id));
             }
             FieldValue::ObjectId(None) => {
-                field_columns[i].push(ExtendedFieldValue::ObjectReference(Id::from(0)));
+                field_columns[i].push(ExtendedFieldValue::Reference(Id::from(0)));
             }
             _ => {
                 field_columns[i].push(ExtendedFieldValue::FieldValue(field_val));
@@ -68,19 +63,18 @@ fn build_column(field_val_vec: &[ExtendedFieldValue], index: &HprofIndex, expect
     match expected_type {
         DataType::Struct(_) => {
             let id_vec = field_val_vec.iter().map(|v| match v {
-                ExtendedFieldValue::ObjectReference(val)
-                | ExtendedFieldValue::PrimitiveArrayReference(val) => val.id(),
+                ExtendedFieldValue::Reference(val) => val.id(),
                 _ => 0,
             }).collect::<Vec<u64>>();
-            let type_vec = field_val_vec.iter().map(|v| match v {
-                ExtendedFieldValue::ObjectReference(val)
-                | ExtendedFieldValue::PrimitiveArrayReference(val) => {
-                    resolve_ref_type(*val, index)
+            let type_vec: Vec<std::borrow::Cow<str>> = field_val_vec.iter().map(|v| match v {
+                ExtendedFieldValue::Reference(val) => {
+                    resolve_ref_type_str(*val, index)
                 },
-                _ => "null".to_string(),
-            }).collect::<Vec<String>>();
+                _ => std::borrow::Cow::Borrowed("null"),
+            }).collect();
             let id_array: Arc<dyn Array> = Arc::new(UInt64Array::from(id_vec));
-            let type_array: Arc<dyn Array> = Arc::new(StringArray::from(type_vec));
+            let type_strs: Vec<&str> = type_vec.iter().map(|c| c.as_ref()).collect();
+            let type_array: Arc<dyn Array> = Arc::new(StringArray::from(type_strs));
             let struct_array = StructArray::from(vec![
                 (Arc::new(Field::new("id", DataType::UInt64, false)), id_array),
                 (Arc::new(Field::new("type", DataType::Utf8, false)), type_array),
@@ -145,17 +139,34 @@ fn build_column(field_val_vec: &[ExtendedFieldValue], index: &HprofIndex, expect
     }
 }
 
-fn resolve_ref_type(id: Id, index: &HprofIndex) -> String {
+/// Resolve the type name for an object reference.
+/// Returns a &str where possible to avoid allocation for the common cases
+/// (instance/object array references), falling back to String for rare cases
+/// (primitive array refs, class refs, unresolved).
+fn resolve_ref_type_str<'a>(id: Id, index: &'a HprofIndex) -> std::borrow::Cow<'a, str> {
+    use std::borrow::Cow;
     if id.id() == 0 {
-        return "null".to_string();
+        return Cow::Borrowed("null");
     }
-    index.obj_id_to_class_obj_id
-        .get(&id)
-        .and_then(|class_obj_id| index.classes.get(class_obj_id))
-        .map(|c| c.name.to_string())
-        .or_else(|| index.prim_array_obj_id_to_type.get(&id).map(|pt| format!("{}[]", pt.java_type_name())))
-        .or_else(|| index.classes.get(&id).map(|c| format!("class {}", c.name)))
-        .unwrap_or_else(|| "(unresolved)".to_string())
+    // Most common: instance or object array → class name is a &str from the index
+    if let Some(class_obj_id) = index.obj_id_to_class_obj_id.get(&id) {
+        if let Some(c) = index.classes.get(&*class_obj_id) {
+            return Cow::Borrowed(c.name);
+        }
+    }
+    // Primitive array ref (rarer — only when a field points to a prim array)
+    if let Some(pt) = index.prim_array_obj_id_to_type.get(&id) {
+        return Cow::Owned(format!("{}[]", pt.java_type_name()));
+    }
+    // Class reference
+    if let Some(c) = index.classes.get(&id) {
+        return Cow::Owned(format!("class {}", c.name));
+    }
+    Cow::Borrowed("(unresolved)")
+}
+
+fn resolve_ref_type(id: Id, index: &HprofIndex) -> String {
+    resolve_ref_type_str(id, index).into_owned()
 }
 
 fn format_field_value(fv: &FieldValue) -> (String, String, u64, String) {
@@ -245,7 +256,6 @@ fn process_segment_to_batches<'a>(
                 entry.0.push(instance.obj_id().id());
                 add_instance_values(
                     hprof, &mut entry.1, instance.fields(), field_descriptors,
-                    &index.obj_id_to_class_obj_id, &index.prim_array_obj_id_to_type,
                 );
             }
             SubRecord::PrimitiveArray(pa) => {
@@ -546,49 +556,72 @@ fn build_static_fields_batch(index: &HprofIndex) -> Option<WritableBatch> {
 // to different files concurrently — they only block when two threads need
 // the same file.
 
-use std::sync::{Arc as StdArc, Mutex};
+// ---------------------------------------------------------------------------
+// ShardedWriterPool — lock-free sharded writer pool
+// ---------------------------------------------------------------------------
+// Each shard is a dedicated thread that owns a set of ArrowWriters exclusively.
+// Batches are routed to shards by hashing the file_key. No Mutexes needed —
+// each thread is the sole owner of its writers.
 
-struct SharedWriterPool {
-    writers: Mutex<HashMap<String, StdArc<Mutex<ArrowWriter<std::fs::File>>>>>,
-    props: WriterProperties,
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+struct ShardedWriterPool {
+    senders: Vec<crossbeam_channel::Sender<WritableBatch>>,
+    handles: Vec<std::thread::JoinHandle<()>>,
 }
 
-impl SharedWriterPool {
-    fn new() -> Self {
+impl ShardedWriterPool {
+    fn new(num_shards: usize) -> Self {
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
             .build();
-        SharedWriterPool {
-            writers: Mutex::new(HashMap::new()),
-            props,
+
+        let mut senders = Vec::with_capacity(num_shards);
+        let mut handles = Vec::with_capacity(num_shards);
+
+        for _ in 0..num_shards {
+            let (tx, rx) = crossbeam_channel::unbounded::<WritableBatch>();
+            let props = props.clone();
+            let handle = std::thread::spawn(move || {
+                // This thread exclusively owns its writers — no Mutex needed
+                let mut writers: HashMap<String, ArrowWriter<std::fs::File>> = HashMap::new();
+
+                for wb in rx {
+                    let writer = writers.entry(wb.file_key.clone()).or_insert_with(|| {
+                        let safe_name = wb.file_key.replace("/", ".");
+                        let file = std::fs::File::create(format!("parquet/{}.parquet", safe_name)).unwrap();
+                        ArrowWriter::try_new(file, wb.schema.clone(), Some(props.clone())).unwrap()
+                    });
+                    writer.write(&wb.batch).unwrap();
+                }
+
+                // Close all writers owned by this shard
+                for (_name, writer) in writers {
+                    writer.close().unwrap();
+                }
+            });
+            senders.push(tx);
+            handles.push(handle);
         }
+
+        ShardedWriterPool { senders, handles }
     }
 
-    fn write_batch(&self, file_key: &str, schema: Arc<Schema>, batch: &RecordBatch) {
-        // Hold outer lock briefly: get or create the writer, clone the Arc
-        let writer_arc = {
-            let mut map = self.writers.lock().unwrap();
-            map.entry(file_key.to_string()).or_insert_with(|| {
-                let safe_name = file_key.replace("/", ".");
-                let file = std::fs::File::create(format!("parquet/{}.parquet", safe_name)).unwrap();
-                StdArc::new(Mutex::new(
-                    ArrowWriter::try_new(file, schema, Some(self.props.clone())).unwrap()
-                ))
-            }).clone()
-        };
-        // Per-writer lock: encoding + compression happens here, other files unblocked
-        writer_arc.lock().unwrap().write(batch).unwrap();
+    fn write_batch(&self, wb: WritableBatch) {
+        let mut hasher = DefaultHasher::new();
+        wb.file_key.hash(&mut hasher);
+        let shard = (hasher.finish() as usize) % self.senders.len();
+        self.senders[shard].send(wb).unwrap();
     }
 
     fn close_all(self) {
-        let map = self.writers.into_inner().unwrap();
-        let writers: Vec<_> = map.into_iter().collect();
-        writers.into_par_iter().for_each(|(_name, writer_arc)| {
-            let writer = StdArc::try_unwrap(writer_arc)
-                .expect("writer Arc still has multiple owners")
-                .into_inner().unwrap();
-            writer.close().unwrap();
-        });
+        // Drop all senders to signal threads to finish
+        drop(self.senders);
+        // Wait for all shard threads to close their writers
+        for handle in self.handles {
+            handle.join().unwrap();
+        }
     }
 }
 
@@ -619,30 +652,40 @@ pub fn dump_objects_to_parquet(hprof: &Hprof, _flush_row_threshold: usize) {
     println!("{} schemas generated", schemas.len());
 
     // -----------------------------------------------------------------------
-    // Pass 2: Fully parallel compute + write (one file per class)
+    // Pass 2: Parallel compute + sharded lock-free write
     // -----------------------------------------------------------------------
-    // Each rayon thread processes a segment, builds RecordBatches, and writes
-    // them directly to the shared writer pool. Different files are written
-    // concurrently; same-file access is serialized by per-writer Mutexes.
+    // Rayon threads process segments and send WritableBatches to shard threads.
+    // Each shard thread owns a set of files exclusively (hashed by file_key),
+    // so there is zero Mutex contention on writers.
     let t1 = Instant::now();
-    let pool = SharedWriterPool::new();
+    let num_shards = 16;
+    let pool = ShardedWriterPool::new(num_shards);
 
-    segments.par_iter().for_each(|record| {
-        let batches = process_segment_to_batches(record, hprof, &index, &schemas);
-        for wb in batches {
-            pool.write_batch(&wb.file_key, wb.schema, &wb.batch);
-        }
+    // Use a smaller rayon pool for compute so shard threads get more CPU.
+    // Compute only needs ~10s of wall time — 8 threads is plenty.
+    let compute_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(5)
+        .build()
+        .unwrap();
+
+    compute_pool.install(|| {
+        segments.par_iter().for_each(|record| {
+            let batches = process_segment_to_batches(record, hprof, &index, &schemas);
+            for wb in batches {
+                pool.write_batch(wb);
+            }
+        });
     });
 
     // Write static fields
     if let Some(sb) = build_static_fields_batch(&index) {
-        pool.write_batch(&sb.file_key, sb.schema.clone(), &sb.batch);
+        pool.write_batch(sb);
     }
 
     let pass2_dur = t1.elapsed();
     println!("Pass 2 in {:.1}s", pass2_dur.as_secs_f64());
 
-    // Close all writers in parallel (writes parquet footers)
+    // Close all shard threads and their writers
     let t2 = Instant::now();
     pool.close_all();
     println!("Writers closed in {:.1}s", t2.elapsed().as_secs_f64());

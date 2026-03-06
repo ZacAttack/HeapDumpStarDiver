@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use dashmap::DashMap;
 use jvm_hprof::{EzClass, Hprof, Id, RecordTag};
 use jvm_hprof::heap_dump::{FieldType, FieldValue, PrimitiveArrayType, SubRecord};
 use crate::hprof_index::HprofIndex;
@@ -93,7 +94,7 @@ pub fn dump_objects(hprof: &Hprof) {
                                     Some(id) => {
                                         let element_class_name = index.obj_id_to_class_obj_id
                                             .get(&id)
-                                            .and_then(|class_id| index.classes.get(class_id))
+                                            .and_then(|class_id| index.classes.get(&*class_id))
                                             .map(|c| c.name)
                                             .unwrap_or_else(|| "(could not resolve class)");
 
@@ -179,9 +180,9 @@ fn print_field_val(
     field_val: &FieldValue,
     field_name: &str,
     field_type: FieldType,
-    obj_id_to_class_obj_id: &HashMap<Id, Id>,
+    obj_id_to_class_obj_id: &DashMap<Id, Id>,
     classes: &HashMap<Id, EzClass>,
-    prim_array_obj_id_to_type: &HashMap<Id, PrimitiveArrayType>,
+    prim_array_obj_id_to_type: &DashMap<Id, PrimitiveArrayType>,
 ) {
     match field_val {
         FieldValue::ObjectId(Some(field_ref_id)) => {
@@ -193,7 +194,7 @@ fn print_field_val(
                         field_name,
                         field_ref_id,
                         classes
-                            .get(class_obj_id)
+                            .get(&*class_obj_id)
                             .map(|c| c.name)
                             .unwrap_or("(class not found)"),
                     );

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use dashmap::DashMap;
 use jvm_hprof::{Hprof, Id, LoadClass, Record, RecordTag, EzClass, build_type_hierarchy_field_descriptors};
 use jvm_hprof::heap_dump::{FieldDescriptor, PrimitiveArrayType, SubRecord};
 use rayon::prelude::*;
@@ -7,18 +8,11 @@ pub(crate) struct HprofIndex<'a> {
     pub utf8: HashMap<Id, &'a str>,
     pub load_classes: HashMap<Id, LoadClass>,
     pub classes: HashMap<Id, EzClass<'a>>,
-    pub obj_id_to_class_obj_id: HashMap<Id, Id>,
-    pub prim_array_obj_id_to_type: HashMap<Id, PrimitiveArrayType>,
+    pub obj_id_to_class_obj_id: DashMap<Id, Id>,
+    pub prim_array_obj_id_to_type: DashMap<Id, PrimitiveArrayType>,
     pub class_instance_field_descriptors: HashMap<Id, Vec<FieldDescriptor>>,
     /// For each class, the declaring class name for each field descriptor (parallel to class_instance_field_descriptors)
     pub class_field_declaring_classes: HashMap<Id, Vec<&'a str>>,
-}
-
-/// Per-segment partial index produced by a rayon thread.
-struct SegmentIndexResult<'a> {
-    classes: HashMap<Id, EzClass<'a>>,
-    obj_id_to_class_obj_id: HashMap<Id, Id>,
-    prim_array_obj_id_to_type: HashMap<Id, PrimitiveArrayType>,
 }
 
 impl<'a> HprofIndex<'a> {
@@ -32,11 +26,13 @@ impl<'a> HprofIndex<'a> {
     ///
     /// Phase 1a: Quick sequential scan — collect UTF8, LoadClass, and segment
     ///           Record handles. No sub-record parsing (fast).
-    /// Phase 1b: Parallel sub-record processing via rayon — builds classes,
-    ///           obj_id_to_class_obj_id, prim_array_obj_id_to_type across threads.
+    /// Phase 1b: Parallel sub-record processing via rayon — inserts directly
+    ///           into shared DashMaps (no merge step needed).
     pub fn build_with_segments(hprof: &'a Hprof<'a>) -> (Self, Vec<Record<'a>>) {
+        use std::time::Instant;
+
         // Phase 1a: Quick sequential scan of top-level records.
-        // Record<'a> is Copy — just holds &[u8] into the mmap.
+        let t0 = Instant::now();
         let mut utf8 = HashMap::new();
         let mut load_classes = HashMap::new();
         let mut segments: Vec<Record<'a>> = Vec::new();
@@ -58,81 +54,65 @@ impl<'a> HprofIndex<'a> {
                 _ => {}
             }
         }
+        let phase1a_dur = t0.elapsed();
+        println!("  Phase 1a (sequential scan): {:.1}s — {} utf8, {} load_classes, {} segments",
+            phase1a_dur.as_secs_f64(), utf8.len(), load_classes.len(), segments.len());
 
         // Phase 1b: Parallel sub-record processing.
-        // Each segment is processed independently; results are merged after.
-        let partial_results: Vec<SegmentIndexResult<'a>> = segments.par_iter()
-            .map(|r| {
-                let mut classes = HashMap::new();
-                let mut obj_id_to_class_obj_id = HashMap::new();
-                let mut prim_array_obj_id_to_type = HashMap::new();
+        // Shared concurrent maps — rayon threads insert directly, no merge needed.
+        // Pre-size to reduce rehashing. Typical heap: ~200M instances, ~85M prim arrays.
+        let t1 = Instant::now();
+        let obj_id_to_class_obj_id: DashMap<Id, Id> = DashMap::with_capacity(200_000_000);
+        let prim_array_obj_id_to_type: DashMap<Id, PrimitiveArrayType> = DashMap::with_capacity(100_000_000);
+        // Classes are small (thousands, not millions), so thread-local + merge is fine.
+        let classes_partial: std::sync::Mutex<HashMap<Id, EzClass<'a>>> = std::sync::Mutex::new(HashMap::new());
 
-                let segment = r.as_heap_dump_segment().unwrap().unwrap();
-                for p in segment.sub_records() {
-                    let s = p.unwrap();
-                    match s {
-                        SubRecord::Class(c) => {
-                            classes.insert(
-                                c.obj_id(),
-                                EzClass::from_class(&c, &load_classes, &utf8),
-                            );
-                        }
-                        SubRecord::Instance(instance) => {
-                            obj_id_to_class_obj_id
-                                .insert(instance.obj_id(), instance.class_obj_id());
-                        }
-                        SubRecord::ObjectArray(obj_array) => {
-                            obj_id_to_class_obj_id
-                                .insert(obj_array.obj_id(), obj_array.array_class_obj_id());
-                        }
-                        SubRecord::PrimitiveArray(pa) => {
-                            prim_array_obj_id_to_type
-                                .insert(pa.obj_id(), pa.primitive_type());
-                        }
-                        _ => {}
+        segments.par_iter().for_each(|r| {
+            let mut local_classes = HashMap::new();
+
+            let segment = r.as_heap_dump_segment().unwrap().unwrap();
+            for p in segment.sub_records() {
+                let s = p.unwrap();
+                match s {
+                    SubRecord::Class(c) => {
+                        local_classes.insert(
+                            c.obj_id(),
+                            EzClass::from_class(&c, &load_classes, &utf8),
+                        );
                     }
+                    SubRecord::Instance(instance) => {
+                        obj_id_to_class_obj_id
+                            .insert(instance.obj_id(), instance.class_obj_id());
+                    }
+                    SubRecord::ObjectArray(obj_array) => {
+                        obj_id_to_class_obj_id
+                            .insert(obj_array.obj_id(), obj_array.array_class_obj_id());
+                    }
+                    SubRecord::PrimitiveArray(pa) => {
+                        prim_array_obj_id_to_type
+                            .insert(pa.obj_id(), pa.primitive_type());
+                    }
+                    _ => {}
                 }
+            }
 
-                SegmentIndexResult {
-                    classes,
-                    obj_id_to_class_obj_id,
-                    prim_array_obj_id_to_type,
-                }
-            })
-            .collect();
+            if !local_classes.is_empty() {
+                classes_partial.lock().unwrap().extend(local_classes);
+            }
+        });
 
-        // Merge partial results — pre-size to avoid rehashing
-        let total_obj_ids: usize = partial_results.iter().map(|p| p.obj_id_to_class_obj_id.len()).sum();
-        let total_prim: usize = partial_results.iter().map(|p| p.prim_array_obj_id_to_type.len()).sum();
-        let mut classes: HashMap<Id, EzClass<'a>> = HashMap::new();
-        let mut obj_id_to_class_obj_id: HashMap<Id, Id> = HashMap::with_capacity(total_obj_ids);
-        let mut prim_array_obj_id_to_type: HashMap<Id, PrimitiveArrayType> = HashMap::with_capacity(total_prim);
+        let classes = classes_partial.into_inner().unwrap();
+        let phase1b_dur = t1.elapsed();
+        println!("  Phase 1b (parallel index + DashMap): {:.1}s — {} classes, {} obj mappings, {} prim mappings",
+            phase1b_dur.as_secs_f64(), classes.len(), obj_id_to_class_obj_id.len(), prim_array_obj_id_to_type.len());
 
-        for partial in partial_results {
-            classes.extend(partial.classes);
-            obj_id_to_class_obj_id.extend(partial.obj_id_to_class_obj_id);
-            prim_array_obj_id_to_type.extend(partial.prim_array_obj_id_to_type);
-        }
-
-        let index = Self::finish(utf8, load_classes, classes, obj_id_to_class_obj_id, prim_array_obj_id_to_type);
-        (index, segments)
-    }
-
-    /// Common finalization: build field descriptors and declaring class maps from the merged data.
-    fn finish(
-        utf8: HashMap<Id, &'a str>,
-        load_classes: HashMap<Id, LoadClass>,
-        classes: HashMap<Id, EzClass<'a>>,
-        obj_id_to_class_obj_id: HashMap<Id, Id>,
-        prim_array_obj_id_to_type: HashMap<Id, PrimitiveArrayType>,
-    ) -> Self {
+        // Finalize: build field descriptors and declaring class maps
+        let t2 = Instant::now();
         let class_instance_field_descriptors = build_type_hierarchy_field_descriptors(&classes);
 
-        // Build parallel map of declaring class names for each field descriptor
         let mut class_field_declaring_classes: HashMap<Id, Vec<&str>> = HashMap::new();
         for (id, mc) in &classes {
             let mut declaring_classes = Vec::new();
-            // Child fields come first (same order as build_type_hierarchy_field_descriptors)
             for _ in &mc.instance_field_descriptors {
                 declaring_classes.push(mc.name);
             }
@@ -146,8 +126,10 @@ impl<'a> HprofIndex<'a> {
             }
             class_field_declaring_classes.insert(*id, declaring_classes);
         }
+        let finalize_dur = t2.elapsed();
+        println!("  Phase 1c (finalize): {:.1}s", finalize_dur.as_secs_f64());
 
-        HprofIndex {
+        let index = HprofIndex {
             utf8,
             load_classes,
             classes,
@@ -155,6 +137,7 @@ impl<'a> HprofIndex<'a> {
             prim_array_obj_id_to_type,
             class_instance_field_descriptors,
             class_field_declaring_classes,
-        }
+        };
+        (index, segments)
     }
 }
