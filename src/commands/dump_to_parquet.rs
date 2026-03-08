@@ -131,7 +131,8 @@ fn build_column(field_val_vec: &[ExtendedFieldValue], index: &HprofIndex, expect
         }
         DataType::UInt64 => {
             Arc::new(UInt64Array::from(field_val_vec.iter().map(|v| match v {
-                ExtendedFieldValue::FieldValue(FieldValue::ObjectId(val)) => val.unwrap().id(),
+                ExtendedFieldValue::Reference(val) => val.id(),
+                ExtendedFieldValue::FieldValue(FieldValue::ObjectId(val)) => val.map(|v| v.id()).unwrap_or(0),
                 _ => 0,
             }).collect::<Vec<u64>>()))
         }
@@ -205,6 +206,7 @@ fn process_segment_to_batches<'a>(
     hprof: &Hprof,
     index: &HprofIndex,
     schemas: &HashMap<Id, Schema>,
+    robo_mode: bool,
 ) -> Vec<WritableBatch> {
     let mut batches = Vec::new();
 
@@ -229,12 +231,25 @@ fn process_segment_to_batches<'a>(
     // GC root accumulators
     let mut gc_roots: Vec<(String, u64, Option<u32>, Option<u32>)> = Vec::new();
 
+    // Object index accumulators (robo mode only)
+    let mut idx_obj_ids: Vec<u64> = Vec::new();
+    let mut idx_type_names: Vec<String> = Vec::new();
+
     // --- Parse sub-records ---
     let segment = record.as_heap_dump_segment().unwrap().unwrap();
     for p in segment.sub_records() {
         let s = p.unwrap();
         match s {
             SubRecord::Instance(instance) => {
+                if robo_mode {
+                    idx_obj_ids.push(instance.obj_id().id());
+                    idx_type_names.push(
+                        index.classes.get(&instance.class_obj_id())
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_else(|| "(unresolved)".to_string())
+                    );
+                }
+
                 let field_descriptors = match index.class_instance_field_descriptors
                     .get(&instance.class_obj_id())
                 {
@@ -260,6 +275,10 @@ fn process_segment_to_batches<'a>(
             }
             SubRecord::PrimitiveArray(pa) => {
                 let obj_id = pa.obj_id().id();
+                if robo_mode {
+                    idx_obj_ids.push(obj_id);
+                    idx_type_names.push(format!("{}[]", pa.primitive_type().java_type_name()));
+                }
                 match pa.primitive_type() {
                     PrimitiveArrayType::Boolean => {
                         bool_arrays.push((obj_id, pa.booleans().unwrap().map(|v| v.unwrap()).collect()));
@@ -288,6 +307,14 @@ fn process_segment_to_batches<'a>(
                 }
             }
             SubRecord::ObjectArray(oa) => {
+                if robo_mode {
+                    idx_obj_ids.push(oa.obj_id().id());
+                    idx_type_names.push(
+                        index.classes.get(&oa.array_class_obj_id())
+                            .map(|c| format!("{}[]", c.name))
+                            .unwrap_or_else(|| "(unresolved)[]".to_string())
+                    );
+                }
                 oa_obj_ids.push(oa.obj_id().id());
                 oa_class_names.push(
                     index.classes.get(&oa.array_class_obj_id())
@@ -329,6 +356,14 @@ fn process_segment_to_batches<'a>(
             }
             SubRecord::GcRootBusyMonitor(r) => {
                 gc_roots.push(("BusyMonitor".into(), r.obj_id().id(), None, None));
+            }
+            SubRecord::Class(c) if robo_mode => {
+                idx_obj_ids.push(c.obj_id().id());
+                idx_type_names.push(
+                    index.classes.get(&c.obj_id())
+                        .map(|ec| format!("class {}", ec.name))
+                        .unwrap_or_else(|| "class (unresolved)".to_string())
+                );
             }
             _ => {}
         }
@@ -457,6 +492,22 @@ fn process_segment_to_batches<'a>(
         batches.push(WritableBatch { file_key: "_gc_roots".into(), schema, batch });
     }
 
+    // Object index batch (robo mode)
+    if !idx_obj_ids.is_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("obj_id", DataType::UInt64, false),
+            Field::new("type_name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(idx_obj_ids)) as Arc<dyn Array>,
+                Arc::new(StringArray::from(idx_type_names)) as Arc<dyn Array>,
+            ],
+        ).unwrap();
+        batches.push(WritableBatch { file_key: "_object_index".into(), schema, batch });
+    }
+
     batches
 }
 
@@ -464,13 +515,14 @@ fn process_segment_to_batches<'a>(
 // Schema generation
 // ---------------------------------------------------------------------------
 
-fn generate_all_schemas(index: &HprofIndex) -> HashMap<Id, Schema> {
+fn generate_all_schemas(index: &HprofIndex, robo_mode: bool) -> HashMap<Id, Schema> {
     index.class_instance_field_descriptors.iter()
         .map(|(class_id, field_descriptors)| {
             let schema = generate_schema_from_descriptors(
                 field_descriptors,
                 &index.utf8,
                 index.class_field_declaring_classes.get(class_id),
+                robo_mode,
             );
             (*class_id, schema)
         })
@@ -481,7 +533,7 @@ fn generate_all_schemas(index: &HprofIndex) -> HashMap<Id, Schema> {
 // Static fields writer
 // ---------------------------------------------------------------------------
 
-fn build_static_fields_batch(index: &HprofIndex) -> Option<WritableBatch> {
+fn build_static_fields_batch(index: &HprofIndex, robo_mode: bool) -> Option<WritableBatch> {
     let mut class_obj_ids: Vec<u64> = Vec::new();
     let mut class_names: Vec<String> = Vec::new();
     let mut field_names: Vec<String> = Vec::new();
@@ -504,15 +556,19 @@ fn build_static_fields_batch(index: &HprofIndex) -> Option<WritableBatch> {
 
             if matches!(sf.field_type(), FieldType::ObjectId) {
                 ref_ids.push(rid);
-                if rt.is_empty() && rid != 0 {
-                    ref_types.push(resolve_ref_type(Id::from(rid), index));
-                } else {
-                    ref_types.push(rt);
+                if !robo_mode {
+                    if rt.is_empty() && rid != 0 {
+                        ref_types.push(resolve_ref_type(Id::from(rid), index));
+                    } else {
+                        ref_types.push(rt);
+                    }
                 }
                 primitive_values.push(String::new());
             } else {
                 ref_ids.push(0);
-                ref_types.push(String::new());
+                if !robo_mode {
+                    ref_types.push(String::new());
+                }
                 primitive_values.push(pv);
             }
         }
@@ -522,30 +578,55 @@ fn build_static_fields_batch(index: &HprofIndex) -> Option<WritableBatch> {
         return None;
     }
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("class_obj_id", DataType::UInt64, false),
-        Field::new("class_name", DataType::Utf8, false),
-        Field::new("field_name", DataType::Utf8, false),
-        Field::new("field_type", DataType::Utf8, false),
-        Field::new("primitive_value", DataType::Utf8, false),
-        Field::new("ref_id", DataType::UInt64, false),
-        Field::new("ref_type", DataType::Utf8, false),
-    ]));
+    if robo_mode {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("class_obj_id", DataType::UInt64, false),
+            Field::new("class_name", DataType::Utf8, false),
+            Field::new("field_name", DataType::Utf8, false),
+            Field::new("field_type", DataType::Utf8, false),
+            Field::new("primitive_value", DataType::Utf8, false),
+            Field::new("ref_id", DataType::UInt64, false),
+        ]));
 
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(UInt64Array::from(class_obj_ids)) as Arc<dyn Array>,
-            Arc::new(StringArray::from(class_names)) as Arc<dyn Array>,
-            Arc::new(StringArray::from(field_names)) as Arc<dyn Array>,
-            Arc::new(StringArray::from(field_types)) as Arc<dyn Array>,
-            Arc::new(StringArray::from(primitive_values)) as Arc<dyn Array>,
-            Arc::new(UInt64Array::from(ref_ids)) as Arc<dyn Array>,
-            Arc::new(StringArray::from(ref_types)) as Arc<dyn Array>,
-        ],
-    ).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(class_obj_ids)) as Arc<dyn Array>,
+                Arc::new(StringArray::from(class_names)) as Arc<dyn Array>,
+                Arc::new(StringArray::from(field_names)) as Arc<dyn Array>,
+                Arc::new(StringArray::from(field_types)) as Arc<dyn Array>,
+                Arc::new(StringArray::from(primitive_values)) as Arc<dyn Array>,
+                Arc::new(UInt64Array::from(ref_ids)) as Arc<dyn Array>,
+            ],
+        ).unwrap();
 
-    Some(WritableBatch { file_key: "_static_fields".into(), schema, batch })
+        Some(WritableBatch { file_key: "_static_fields".into(), schema, batch })
+    } else {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("class_obj_id", DataType::UInt64, false),
+            Field::new("class_name", DataType::Utf8, false),
+            Field::new("field_name", DataType::Utf8, false),
+            Field::new("field_type", DataType::Utf8, false),
+            Field::new("primitive_value", DataType::Utf8, false),
+            Field::new("ref_id", DataType::UInt64, false),
+            Field::new("ref_type", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(class_obj_ids)) as Arc<dyn Array>,
+                Arc::new(StringArray::from(class_names)) as Arc<dyn Array>,
+                Arc::new(StringArray::from(field_names)) as Arc<dyn Array>,
+                Arc::new(StringArray::from(field_types)) as Arc<dyn Array>,
+                Arc::new(StringArray::from(primitive_values)) as Arc<dyn Array>,
+                Arc::new(UInt64Array::from(ref_ids)) as Arc<dyn Array>,
+                Arc::new(StringArray::from(ref_types)) as Arc<dyn Array>,
+            ],
+        ).unwrap();
+
+        Some(WritableBatch { file_key: "_static_fields".into(), schema, batch })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -569,50 +650,85 @@ use std::hash::{Hash, Hasher};
 struct ShardedWriterPool {
     senders: Vec<crossbeam_channel::Sender<WritableBatch>>,
     handles: Vec<std::thread::JoinHandle<()>>,
+    robo_mode: bool,
 }
 
 impl ShardedWriterPool {
-    fn new(num_shards: usize) -> Self {
+    fn new(num_shards: usize, compression: Compression, robo_mode: bool) -> Self {
         let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
+            .set_compression(compression)
             .build();
 
-        let mut senders = Vec::with_capacity(num_shards);
+        let mut senders = Vec::with_capacity(if robo_mode { 1 } else { num_shards });
         let mut handles = Vec::with_capacity(num_shards);
 
-        for _ in 0..num_shards {
+        if robo_mode {
+            // MPMC: one shared channel, all workers pull from the same queue
             let (tx, rx) = crossbeam_channel::unbounded::<WritableBatch>();
-            let props = props.clone();
-            let handle = std::thread::spawn(move || {
-                // This thread exclusively owns its writers — no Mutex needed
-                let mut writers: HashMap<String, ArrowWriter<std::fs::File>> = HashMap::new();
+            for worker_id in 0..num_shards {
+                let rx = rx.clone();
+                let props = props.clone();
+                let handle = std::thread::spawn(move || {
+                    let mut writers: HashMap<String, ArrowWriter<std::fs::File>> = HashMap::new();
 
-                for wb in rx {
-                    let writer = writers.entry(wb.file_key.clone()).or_insert_with(|| {
-                        let safe_name = wb.file_key.replace("/", ".");
-                        let file = std::fs::File::create(format!("parquet/{}.parquet", safe_name)).unwrap();
-                        ArrowWriter::try_new(file, wb.schema.clone(), Some(props.clone())).unwrap()
-                    });
-                    writer.write(&wb.batch).unwrap();
-                }
+                    for wb in rx {
+                        let writer = writers.entry(wb.file_key.clone()).or_insert_with(|| {
+                            let safe_name = wb.file_key.replace("/", ".");
+                            let file = std::fs::File::create(
+                                format!("parquet/{}_chunk{}.parquet", safe_name, worker_id)
+                            ).unwrap();
+                            ArrowWriter::try_new(file, wb.schema.clone(), Some(props.clone())).unwrap()
+                        });
+                        writer.write(&wb.batch).unwrap();
+                    }
 
-                // Close all writers owned by this shard
-                for (_name, writer) in writers {
-                    writer.close().unwrap();
-                }
-            });
+                    for (_name, writer) in writers {
+                        writer.close().unwrap();
+                    }
+                });
+                handles.push(handle);
+            }
             senders.push(tx);
-            handles.push(handle);
+        } else {
+            // Per-shard channels with hash routing (existing behavior)
+            for _ in 0..num_shards {
+                let (tx, rx) = crossbeam_channel::unbounded::<WritableBatch>();
+                let props = props.clone();
+                let handle = std::thread::spawn(move || {
+                    let mut writers: HashMap<String, ArrowWriter<std::fs::File>> = HashMap::new();
+
+                    for wb in rx {
+                        let writer = writers.entry(wb.file_key.clone()).or_insert_with(|| {
+                            let safe_name = wb.file_key.replace("/", ".");
+                            let file = std::fs::File::create(format!("parquet/{}.parquet", safe_name)).unwrap();
+                            ArrowWriter::try_new(file, wb.schema.clone(), Some(props.clone())).unwrap()
+                        });
+                        writer.write(&wb.batch).unwrap();
+                    }
+
+                    for (_name, writer) in writers {
+                        writer.close().unwrap();
+                    }
+                });
+                senders.push(tx);
+                handles.push(handle);
+            }
         }
 
-        ShardedWriterPool { senders, handles }
+        ShardedWriterPool { senders, handles, robo_mode }
     }
 
     fn write_batch(&self, wb: WritableBatch) {
-        let mut hasher = DefaultHasher::new();
-        wb.file_key.hash(&mut hasher);
-        let shard = (hasher.finish() as usize) % self.senders.len();
-        self.senders[shard].send(wb).unwrap();
+        if self.robo_mode {
+            // MPMC: send to the single shared channel; any idle worker picks it up
+            self.senders[0].send(wb).unwrap();
+        } else {
+            // Hash-route to a specific shard
+            let mut hasher = DefaultHasher::new();
+            wb.file_key.hash(&mut hasher);
+            let shard = (hasher.finish() as usize) % self.senders.len();
+            self.senders[shard].send(wb).unwrap();
+        }
     }
 
     fn close_all(self) {
@@ -626,10 +742,70 @@ impl ShardedWriterPool {
 }
 
 // ---------------------------------------------------------------------------
+// Robo-mode metadata writers
+// ---------------------------------------------------------------------------
+
+/// Write `_class_hierarchy.parquet`: class_obj_id, class_name, super_class_obj_id, super_class_name.
+fn write_class_hierarchy(index: &HprofIndex) {
+    let mut class_obj_ids: Vec<u64> = Vec::new();
+    let mut class_names: Vec<String> = Vec::new();
+    let mut super_class_obj_ids: Vec<Option<u64>> = Vec::new();
+    let mut super_class_names: Vec<Option<String>> = Vec::new();
+
+    for (class_id, ez_class) in index.classes.iter() {
+        class_obj_ids.push(class_id.id());
+        class_names.push(ez_class.name.to_string());
+
+        match ez_class.super_class_obj_id {
+            Some(super_id) => {
+                super_class_obj_ids.push(Some(super_id.id()));
+                super_class_names.push(
+                    index.classes.get(&super_id)
+                        .map(|c| c.name.to_string())
+                );
+            }
+            None => {
+                super_class_obj_ids.push(None);
+                super_class_names.push(None);
+            }
+        }
+    }
+
+    if class_obj_ids.is_empty() {
+        return;
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("class_obj_id", DataType::UInt64, false),
+        Field::new("class_name", DataType::Utf8, false),
+        Field::new("super_class_obj_id", DataType::UInt64, true),
+        Field::new("super_class_name", DataType::Utf8, true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(class_obj_ids)) as Arc<dyn Array>,
+            Arc::new(StringArray::from(class_names)) as Arc<dyn Array>,
+            Arc::new(UInt64Array::from(super_class_obj_ids)) as Arc<dyn Array>,
+            Arc::new(StringArray::from(super_class_names)) as Arc<dyn Array>,
+        ],
+    ).unwrap();
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let file = std::fs::File::create("parquet/_class_hierarchy.parquet").unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
-pub fn dump_objects_to_parquet(hprof: &Hprof, _flush_row_threshold: usize) {
+pub fn dump_objects_to_parquet(hprof: &Hprof, _flush_row_threshold: usize, robo_mode: bool) {
     use std::time::Instant;
 
     // Clean output directory so stale files from previous runs don't persist
@@ -647,8 +823,12 @@ pub fn dump_objects_to_parquet(hprof: &Hprof, _flush_row_threshold: usize) {
         pass1_dur.as_secs_f64(),
         index.classes.len(), index.obj_id_to_class_obj_id.len(), segments.len());
 
+    if robo_mode {
+        println!("Robo mode enabled: bare IDs for references, separate type index files");
+    }
+
     // Generate schemas from field descriptors (no file scan needed)
-    let schemas = generate_all_schemas(&index);
+    let schemas = generate_all_schemas(&index, robo_mode);
     println!("{} schemas generated", schemas.len());
 
     // -----------------------------------------------------------------------
@@ -659,7 +839,7 @@ pub fn dump_objects_to_parquet(hprof: &Hprof, _flush_row_threshold: usize) {
     // so there is zero Mutex contention on writers.
     let t1 = Instant::now();
     let num_shards = 16;
-    let pool = ShardedWriterPool::new(num_shards);
+    let pool = ShardedWriterPool::new(num_shards, Compression::SNAPPY, robo_mode);
 
     // Use a smaller rayon pool for compute so shard threads get more CPU.
     // Compute only needs ~10s of wall time — 8 threads is plenty.
@@ -668,9 +848,14 @@ pub fn dump_objects_to_parquet(hprof: &Hprof, _flush_row_threshold: usize) {
         .build()
         .unwrap();
 
+    // Write class hierarchy metadata (tiny — 1,781 rows)
+    if robo_mode {
+        write_class_hierarchy(&index);
+    }
+
     compute_pool.install(|| {
         segments.par_iter().for_each(|record| {
-            let batches = process_segment_to_batches(record, hprof, &index, &schemas);
+            let batches = process_segment_to_batches(record, hprof, &index, &schemas, robo_mode);
             for wb in batches {
                 pool.write_batch(wb);
             }
@@ -678,7 +863,7 @@ pub fn dump_objects_to_parquet(hprof: &Hprof, _flush_row_threshold: usize) {
     });
 
     // Write static fields
-    if let Some(sb) = build_static_fields_batch(&index) {
+    if let Some(sb) = build_static_fields_batch(&index, robo_mode) {
         pool.write_batch(sb);
     }
 

@@ -131,6 +131,7 @@ pub fn generate_schema_from_descriptors(
     field_descriptors: &[FieldDescriptor],
     utf8: &collections::HashMap<Id, &str>,
     declaring_classes: Option<&Vec<&str>>,
+    robo_mode: bool,
 ) -> Schema {
     let ref_struct_type = DataType::Struct(Fields::from(vec![
         Field::new("id", DataType::UInt64, false),
@@ -154,7 +155,7 @@ pub fn generate_schema_from_descriptors(
         *count += 1;
 
         let data_type = match fd.field_type() {
-            FieldType::ObjectId => ref_struct_type.clone(),
+            FieldType::ObjectId => if robo_mode { DataType::UInt64 } else { ref_struct_type.clone() },
             FieldType::Boolean => DataType::Boolean,
             FieldType::Char => DataType::UInt16,
             FieldType::Float => DataType::Float32,

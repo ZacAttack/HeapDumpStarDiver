@@ -29,6 +29,12 @@ fn main() {
                     .default_value("500000")
                     .help("Number of rows to accumulate before flushing to disk (lower = less memory)"),
             )
+            .arg(
+                clap::Arg::new("robo-mode")
+                    .long("robo-mode")
+                    .action(clap::ArgAction::SetTrue)
+                    .help("LLM-optimized output: bare IDs for references, separate type index file. Faster parsing."),
+            )
         );
     let matches = app.get_matches();
 
@@ -45,7 +51,8 @@ fn main() {
         "count-records" => commands::count_records(&hprof),
         "dump-objects-to-parquet" => {
             let flush_rows = *sub_matches.get_one::<usize>("flush-rows").unwrap();
-            commands::dump_objects_to_parquet(&hprof, flush_rows)
+            let robo_mode = sub_matches.get_flag("robo-mode");
+            commands::dump_objects_to_parquet(&hprof, flush_rows, robo_mode)
         }
         _ => panic!("Unknown subcommand"),
     });
