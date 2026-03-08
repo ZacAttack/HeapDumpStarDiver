@@ -52,6 +52,32 @@ Data is flushed to disk incrementally, so memory usage stays bounded even for ve
 ./target/release/HeapDumpStarDiver -f heap.hprof dump-objects-to-parquet --flush-rows 100000
 ```
 
+#### Robo Mode (`--robo-mode`)
+
+Robo mode is an alternative output format optimized for speed at the expense of human readability. It's designed for LLM-assisted querying -- an LLM can easily follow bare object ID references and join across files, negating the readability loss while benefiting from the faster export.
+
+```bash
+./target/release/HeapDumpStarDiver -f heap.hprof dump-objects-to-parquet --robo-mode
+```
+
+**How it differs from default mode:**
+
+| Aspect | Default Mode | Robo Mode |
+|--------|-------------|-----------|
+| Object references | `Struct { id: UInt64, type: Utf8 }` with resolved type names | Bare `UInt64` IDs (no type name resolution) |
+| Type lookup | Embedded in every reference column | Separate `_object_index` file maps obj_id to type name |
+| Class hierarchy | Not exported | `_class_hierarchy.parquet` with superclass relationships |
+| Static fields | Includes `ref_type` column with resolved type names | Omits `ref_type` (use `_object_index` to resolve) |
+| File naming | One file per class: `ClassName.parquet` | Chunked across 16 workers: `ClassName_chunk0.parquet` ... `ClassName_chunk15.parquet` |
+| Speed | Slower (resolves type names for every object reference) | Faster (skips type resolution entirely) |
+
+**Additional files produced in robo mode:**
+
+- `_object_index_chunk{0-15}.parquet` -- Maps every object ID to its type name. Schema: `(obj_id: UInt64, type_name: Utf8)`. Use this to resolve the bare IDs in other files.
+- `_class_hierarchy.parquet` -- Class inheritance tree. Schema: `(class_obj_id: UInt64, class_name: Utf8, super_class_obj_id: UInt64?, super_class_name: Utf8?)`.
+
+**When to use robo mode:** When you're querying the heap dump programmatically (e.g. via Python/DuckDB/an LLM) and want the fastest possible export. The chunked output is trivially queryable -- tools like DuckDB and PyArrow can glob `parquet/ClassName_chunk*.parquet` to read all chunks as one table.
+
 ### dump-objects
 
 Prints all heap objects to stdout in a human-readable format.
