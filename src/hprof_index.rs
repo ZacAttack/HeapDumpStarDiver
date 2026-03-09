@@ -5,12 +5,13 @@ use jvm_hprof::heap_dump::{FieldDescriptor, PrimitiveArrayType, SubRecord};
 use rayon::prelude::*;
 
 /// Resolved stack frame with string names (not raw IDs).
-pub(crate) struct ResolvedStackFrame {
+/// Borrows from the HPROF's UTF8 string table to avoid allocations.
+pub(crate) struct ResolvedStackFrame<'a> {
     pub frame_id: u64,
-    pub method_name: String,
-    pub method_signature: String,
-    pub source_file: String,
-    pub class_name: String,
+    pub method_name: &'a str,
+    pub method_signature: &'a str,
+    pub source_file: &'a str,
+    pub class_name: &'a str,
     pub line_num: i32, // >0 = normal, -1 = unknown, -2 = compiled, -3 = native
 }
 
@@ -30,7 +31,7 @@ pub(crate) struct HprofIndex<'a> {
     pub class_instance_field_descriptors: HashMap<Id, Vec<FieldDescriptor>>,
     /// For each class, the declaring class name for each field descriptor (parallel to class_instance_field_descriptors)
     pub class_field_declaring_classes: HashMap<Id, Vec<&'a str>>,
-    pub stack_frames: Vec<ResolvedStackFrame>,
+    pub stack_frames: Vec<ResolvedStackFrame<'a>>,
     pub stack_traces: Vec<ResolvedStackTrace>,
 }
 
@@ -90,16 +91,13 @@ impl<'a> HprofIndex<'a> {
 
         // Resolve stack frame names from utf8 + load_classes (parallel — can be 30K+ frames)
         let stack_frames: Vec<ResolvedStackFrame> = raw_stack_frames.par_iter().map(|sf| {
-            let method_name = utf8.get(&sf.method_name_id())
-                .unwrap_or(&"(unknown)").to_string();
-            let method_signature = utf8.get(&sf.method_signature_id())
-                .unwrap_or(&"(unknown)").to_string();
-            let source_file = utf8.get(&sf.source_file_name_id())
-                .unwrap_or(&"(unknown)").to_string();
-            let class_name = class_serial_to_obj_id.get(&sf.class_serial().num())
+            let method_name = *utf8.get(&sf.method_name_id()).unwrap_or(&"(unknown)");
+            let method_signature = *utf8.get(&sf.method_signature_id()).unwrap_or(&"(unknown)");
+            let source_file = *utf8.get(&sf.source_file_name_id()).unwrap_or(&"(unknown)");
+            let class_name = *class_serial_to_obj_id.get(&sf.class_serial().num())
                 .and_then(|obj_id| load_classes.get(obj_id))
                 .and_then(|lc| utf8.get(&lc.class_name_id()))
-                .unwrap_or(&"(unknown)").to_string();
+                .unwrap_or(&"(unknown)");
             let line_num = match sf.line_num() {
                 LineNum::Normal(n) => n as i32,
                 LineNum::Unknown => -1,
@@ -116,7 +114,8 @@ impl<'a> HprofIndex<'a> {
             }
         }).collect();
 
-        let stack_traces: Vec<ResolvedStackTrace> = raw_stack_traces.par_iter().map(|st| {
+        // Stack traces are typically few (hundreds) with trivial per-item work — sequential is faster
+        let stack_traces: Vec<ResolvedStackTrace> = raw_stack_traces.iter().map(|st| {
             ResolvedStackTrace {
                 stack_trace_serial: st.stack_trace_serial().num(),
                 thread_serial: st.thread_serial().num(),
@@ -223,10 +222,10 @@ mod tests {
     fn test_resolved_stack_frame_fields() {
         let frame = ResolvedStackFrame {
             frame_id: 12345,
-            method_name: "processRecord".to_string(),
-            method_signature: "(Lcom/linkedin/venice/Record;)V".to_string(),
-            source_file: "Ingestion.java".to_string(),
-            class_name: "com.linkedin.venice.Ingestion".to_string(),
+            method_name: "processRecord",
+            method_signature: "(Lcom/linkedin/venice/Record;)V",
+            source_file: "Ingestion.java",
+            class_name: "com.linkedin.venice.Ingestion",
             line_num: 42,
         };
         assert_eq!(frame.frame_id, 12345);
@@ -241,16 +240,16 @@ mod tests {
     fn test_resolved_stack_frame_special_line_numbers() {
         // Verify the line number encoding contract
         let unknown = ResolvedStackFrame {
-            frame_id: 1, method_name: "".into(), method_signature: "".into(),
-            source_file: "".into(), class_name: "".into(), line_num: -1,
+            frame_id: 1, method_name: "", method_signature: "",
+            source_file: "", class_name: "", line_num: -1,
         };
         let compiled = ResolvedStackFrame {
-            frame_id: 2, method_name: "".into(), method_signature: "".into(),
-            source_file: "".into(), class_name: "".into(), line_num: -2,
+            frame_id: 2, method_name: "", method_signature: "",
+            source_file: "", class_name: "", line_num: -2,
         };
         let native = ResolvedStackFrame {
-            frame_id: 3, method_name: "".into(), method_signature: "".into(),
-            source_file: "".into(), class_name: "".into(), line_num: -3,
+            frame_id: 3, method_name: "", method_signature: "",
+            source_file: "", class_name: "", line_num: -3,
         };
         assert_eq!(unknown.line_num, -1);
         assert_eq!(compiled.line_num, -2);

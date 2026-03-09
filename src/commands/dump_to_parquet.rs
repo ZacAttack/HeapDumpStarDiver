@@ -858,7 +858,8 @@ fn build_stack_traces_batch(index: &HprofIndex) -> Option<WritableBatch> {
     let len = index.stack_traces.len();
     let mut trace_serials: Vec<u32> = Vec::with_capacity(len);
     let mut thread_serials: Vec<u32> = Vec::with_capacity(len);
-    let mut frame_id_lists = ListBuilder::new(UInt64Builder::new());
+    let total_frame_refs: usize = index.stack_traces.iter().map(|st| st.frame_ids.len()).sum();
+    let mut frame_id_lists = ListBuilder::new(UInt64Builder::with_capacity(total_frame_refs));
 
     for st in &index.stack_traces {
         trace_serials.push(st.stack_trace_serial);
@@ -978,7 +979,7 @@ mod tests {
 
     /// Create a minimal HprofIndex with only stack_frames and stack_traces populated.
     fn make_test_index<'a>(
-        frames: Vec<ResolvedStackFrame>,
+        frames: Vec<ResolvedStackFrame<'a>>,
         traces: Vec<ResolvedStackTrace>,
     ) -> HprofIndex<'a> {
         HprofIndex {
@@ -1008,10 +1009,10 @@ mod tests {
     fn test_build_stack_frames_batch_single_frame() {
         let frames = vec![ResolvedStackFrame {
             frame_id: 42,
-            method_name: "run".to_string(),
-            method_signature: "()V".to_string(),
-            source_file: "Main.java".to_string(),
-            class_name: "com.example.Main".to_string(),
+            method_name: "run",
+            method_signature: "()V",
+            source_file: "Main.java",
+            class_name: "com.example.Main",
             line_num: 100,
         }];
         let index = make_test_index(frames, vec![]);
@@ -1046,26 +1047,26 @@ mod tests {
         let frames = vec![
             ResolvedStackFrame {
                 frame_id: 1,
-                method_name: "methodA".to_string(),
-                method_signature: "(I)V".to_string(),
-                source_file: "A.java".to_string(),
-                class_name: "com.example.A".to_string(),
+                method_name: "methodA",
+                method_signature: "(I)V",
+                source_file: "A.java",
+                class_name: "com.example.A",
                 line_num: 10,
             },
             ResolvedStackFrame {
                 frame_id: 2,
-                method_name: "methodB".to_string(),
-                method_signature: "(Ljava/lang/String;)I".to_string(),
-                source_file: "B.java".to_string(),
-                class_name: "com.example.B".to_string(),
+                method_name: "methodB",
+                method_signature: "(Ljava/lang/String;)I",
+                source_file: "B.java",
+                class_name: "com.example.B",
                 line_num: -1, // unknown
             },
             ResolvedStackFrame {
                 frame_id: 3,
-                method_name: "nativeCall".to_string(),
-                method_signature: "()J".to_string(),
-                source_file: "(unknown)".to_string(),
-                class_name: "sun.misc.Unsafe".to_string(),
+                method_name: "nativeCall",
+                method_signature: "()J",
+                source_file: "(unknown)",
+                class_name: "sun.misc.Unsafe",
                 line_num: -3, // native method
             },
         ];
@@ -1089,20 +1090,20 @@ mod tests {
     fn test_build_stack_frames_batch_all_line_num_variants() {
         let frames = vec![
             ResolvedStackFrame {
-                frame_id: 1, method_name: "a".into(), method_signature: "".into(),
-                source_file: "".into(), class_name: "".into(), line_num: 42, // Normal
+                frame_id: 1, method_name: "a", method_signature: "",
+                source_file: "", class_name: "", line_num: 42, // Normal
             },
             ResolvedStackFrame {
-                frame_id: 2, method_name: "b".into(), method_signature: "".into(),
-                source_file: "".into(), class_name: "".into(), line_num: -1, // Unknown
+                frame_id: 2, method_name: "b", method_signature: "",
+                source_file: "", class_name: "", line_num: -1, // Unknown
             },
             ResolvedStackFrame {
-                frame_id: 3, method_name: "c".into(), method_signature: "".into(),
-                source_file: "".into(), class_name: "".into(), line_num: -2, // Compiled
+                frame_id: 3, method_name: "c", method_signature: "",
+                source_file: "", class_name: "", line_num: -2, // Compiled
             },
             ResolvedStackFrame {
-                frame_id: 4, method_name: "d".into(), method_signature: "".into(),
-                source_file: "".into(), class_name: "".into(), line_num: -3, // Native
+                frame_id: 4, method_name: "d", method_signature: "",
+                source_file: "", class_name: "", line_num: -3, // Native
             },
         ];
         let index = make_test_index(frames, vec![]);
@@ -1118,8 +1119,8 @@ mod tests {
     #[test]
     fn test_build_stack_frames_batch_schema() {
         let frames = vec![ResolvedStackFrame {
-            frame_id: 1, method_name: "m".into(), method_signature: "()V".into(),
-            source_file: "X.java".into(), class_name: "X".into(), line_num: 1,
+            frame_id: 1, method_name: "m", method_signature: "()V",
+            source_file: "X.java", class_name: "X", line_num: 1,
         }];
         let index = make_test_index(frames, vec![]);
         let wb = build_stack_frames_batch(&index).unwrap();
@@ -1246,12 +1247,12 @@ mod tests {
     fn test_both_batches_from_populated_index() {
         let frames = vec![
             ResolvedStackFrame {
-                frame_id: 100, method_name: "run".into(), method_signature: "()V".into(),
-                source_file: "Thread.java".into(), class_name: "java.lang.Thread".into(), line_num: 748,
+                frame_id: 100, method_name: "run", method_signature: "()V",
+                source_file: "Thread.java", class_name: "java.lang.Thread", line_num: 748,
             },
             ResolvedStackFrame {
-                frame_id: 200, method_name: "main".into(), method_signature: "([Ljava/lang/String;)V".into(),
-                source_file: "App.java".into(), class_name: "com.example.App".into(), line_num: 15,
+                frame_id: 200, method_name: "main", method_signature: "([Ljava/lang/String;)V",
+                source_file: "App.java", class_name: "com.example.App", line_num: 15,
             },
         ];
         let traces = vec![ResolvedStackTrace {
