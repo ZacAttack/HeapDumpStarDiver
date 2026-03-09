@@ -1,8 +1,25 @@
 use std::collections::HashMap;
 use dashmap::DashMap;
-use jvm_hprof::{Hprof, Id, LoadClass, Record, RecordTag, EzClass, build_type_hierarchy_field_descriptors};
+use jvm_hprof::{Hprof, Id, LineNum, LoadClass, Record, RecordTag, EzClass, build_type_hierarchy_field_descriptors};
 use jvm_hprof::heap_dump::{FieldDescriptor, PrimitiveArrayType, SubRecord};
 use rayon::prelude::*;
+
+/// Resolved stack frame with string names (not raw IDs).
+pub(crate) struct ResolvedStackFrame {
+    pub frame_id: u64,
+    pub method_name: String,
+    pub method_signature: String,
+    pub source_file: String,
+    pub class_name: String,
+    pub line_num: i32, // >0 = normal, -1 = unknown, -2 = compiled, -3 = native
+}
+
+/// Resolved stack trace with frame IDs expanded.
+pub(crate) struct ResolvedStackTrace {
+    pub stack_trace_serial: u32,
+    pub thread_serial: u32,
+    pub frame_ids: Vec<u64>,
+}
 
 pub(crate) struct HprofIndex<'a> {
     pub utf8: HashMap<Id, &'a str>,
@@ -13,6 +30,8 @@ pub(crate) struct HprofIndex<'a> {
     pub class_instance_field_descriptors: HashMap<Id, Vec<FieldDescriptor>>,
     /// For each class, the declaring class name for each field descriptor (parallel to class_instance_field_descriptors)
     pub class_field_declaring_classes: HashMap<Id, Vec<&'a str>>,
+    pub stack_frames: Vec<ResolvedStackFrame>,
+    pub stack_traces: Vec<ResolvedStackTrace>,
 }
 
 impl<'a> HprofIndex<'a> {
@@ -36,6 +55,11 @@ impl<'a> HprofIndex<'a> {
         let mut utf8 = HashMap::new();
         let mut load_classes = HashMap::new();
         let mut segments: Vec<Record<'a>> = Vec::new();
+        // Collect raw stack frames/traces — resolve names after utf8 + load_classes are complete
+        let mut raw_stack_frames = Vec::new();
+        let mut raw_stack_traces = Vec::new();
+        // serial → class_obj_id mapping for resolving StackFrame.class_serial → class name
+        let mut class_serial_to_obj_id: HashMap<u32, Id> = HashMap::new();
 
         for r in hprof.records_iter().map(|r| r.unwrap()) {
             match r.tag() {
@@ -46,7 +70,16 @@ impl<'a> HprofIndex<'a> {
                 }
                 RecordTag::LoadClass => {
                     let lc = r.as_load_class().unwrap().unwrap();
+                    class_serial_to_obj_id.insert(lc.class_serial().num(), lc.class_obj_id());
                     load_classes.insert(lc.class_obj_id(), lc);
+                }
+                RecordTag::StackFrame => {
+                    let sf = r.as_stack_frame().unwrap().unwrap();
+                    raw_stack_frames.push(sf);
+                }
+                RecordTag::StackTrace => {
+                    let st = r.as_stack_trace().unwrap().unwrap();
+                    raw_stack_traces.push(st);
                 }
                 RecordTag::HeapDump | RecordTag::HeapDumpSegment => {
                     segments.push(r);
@@ -54,9 +87,47 @@ impl<'a> HprofIndex<'a> {
                 _ => {}
             }
         }
+
+        // Resolve stack frame names from utf8 + load_classes (parallel — can be 30K+ frames)
+        let stack_frames: Vec<ResolvedStackFrame> = raw_stack_frames.par_iter().map(|sf| {
+            let method_name = utf8.get(&sf.method_name_id())
+                .unwrap_or(&"(unknown)").to_string();
+            let method_signature = utf8.get(&sf.method_signature_id())
+                .unwrap_or(&"(unknown)").to_string();
+            let source_file = utf8.get(&sf.source_file_name_id())
+                .unwrap_or(&"(unknown)").to_string();
+            let class_name = class_serial_to_obj_id.get(&sf.class_serial().num())
+                .and_then(|obj_id| load_classes.get(obj_id))
+                .and_then(|lc| utf8.get(&lc.class_name_id()))
+                .unwrap_or(&"(unknown)").to_string();
+            let line_num = match sf.line_num() {
+                LineNum::Normal(n) => n as i32,
+                LineNum::Unknown => -1,
+                LineNum::CompiledMethod => -2,
+                LineNum::NativeMethod => -3,
+            };
+            ResolvedStackFrame {
+                frame_id: sf.id().id(),
+                method_name,
+                method_signature,
+                source_file,
+                class_name,
+                line_num,
+            }
+        }).collect();
+
+        let stack_traces: Vec<ResolvedStackTrace> = raw_stack_traces.par_iter().map(|st| {
+            ResolvedStackTrace {
+                stack_trace_serial: st.stack_trace_serial().num(),
+                thread_serial: st.thread_serial().num(),
+                frame_ids: st.frame_ids().map(|id| id.unwrap().id()).collect(),
+            }
+        }).collect();
+
         let phase1a_dur = t0.elapsed();
-        println!("  Phase 1a (sequential scan): {:.1}s — {} utf8, {} load_classes, {} segments",
-            phase1a_dur.as_secs_f64(), utf8.len(), load_classes.len(), segments.len());
+        println!("  Phase 1a (sequential scan): {:.1}s — {} utf8, {} load_classes, {} segments, {} stack_frames, {} stack_traces",
+            phase1a_dur.as_secs_f64(), utf8.len(), load_classes.len(), segments.len(),
+            stack_frames.len(), stack_traces.len());
 
         // Phase 1b: Parallel sub-record processing.
         // Shared concurrent maps — rayon threads insert directly, no merge needed.
@@ -137,7 +208,74 @@ impl<'a> HprofIndex<'a> {
             prim_array_obj_id_to_type,
             class_instance_field_descriptors,
             class_field_declaring_classes,
+            stack_frames,
+            stack_traces,
         };
         (index, segments)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolved_stack_frame_fields() {
+        let frame = ResolvedStackFrame {
+            frame_id: 12345,
+            method_name: "processRecord".to_string(),
+            method_signature: "(Lcom/linkedin/venice/Record;)V".to_string(),
+            source_file: "Ingestion.java".to_string(),
+            class_name: "com.linkedin.venice.Ingestion".to_string(),
+            line_num: 42,
+        };
+        assert_eq!(frame.frame_id, 12345);
+        assert_eq!(frame.method_name, "processRecord");
+        assert_eq!(frame.method_signature, "(Lcom/linkedin/venice/Record;)V");
+        assert_eq!(frame.source_file, "Ingestion.java");
+        assert_eq!(frame.class_name, "com.linkedin.venice.Ingestion");
+        assert_eq!(frame.line_num, 42);
+    }
+
+    #[test]
+    fn test_resolved_stack_frame_special_line_numbers() {
+        // Verify the line number encoding contract
+        let unknown = ResolvedStackFrame {
+            frame_id: 1, method_name: "".into(), method_signature: "".into(),
+            source_file: "".into(), class_name: "".into(), line_num: -1,
+        };
+        let compiled = ResolvedStackFrame {
+            frame_id: 2, method_name: "".into(), method_signature: "".into(),
+            source_file: "".into(), class_name: "".into(), line_num: -2,
+        };
+        let native = ResolvedStackFrame {
+            frame_id: 3, method_name: "".into(), method_signature: "".into(),
+            source_file: "".into(), class_name: "".into(), line_num: -3,
+        };
+        assert_eq!(unknown.line_num, -1);
+        assert_eq!(compiled.line_num, -2);
+        assert_eq!(native.line_num, -3);
+    }
+
+    #[test]
+    fn test_resolved_stack_trace_fields() {
+        let trace = ResolvedStackTrace {
+            stack_trace_serial: 100,
+            thread_serial: 5,
+            frame_ids: vec![1000, 2000, 3000],
+        };
+        assert_eq!(trace.stack_trace_serial, 100);
+        assert_eq!(trace.thread_serial, 5);
+        assert_eq!(trace.frame_ids, vec![1000, 2000, 3000]);
+    }
+
+    #[test]
+    fn test_resolved_stack_trace_empty_frames() {
+        let trace = ResolvedStackTrace {
+            stack_trace_serial: 1,
+            thread_serial: 1,
+            frame_ids: vec![],
+        };
+        assert!(trace.frame_ids.is_empty());
     }
 }

@@ -801,6 +801,94 @@ fn write_class_hierarchy(index: &HprofIndex) {
     writer.close().unwrap();
 }
 
+/// Build `_stack_frames` WritableBatch: frame_id, class_name, method_name, method_signature, source_file, line_num.
+fn build_stack_frames_batch(index: &HprofIndex) -> Option<WritableBatch> {
+    if index.stack_frames.is_empty() {
+        return None;
+    }
+
+    let len = index.stack_frames.len();
+    let mut frame_ids: Vec<u64> = Vec::with_capacity(len);
+    let mut class_names: Vec<&str> = Vec::with_capacity(len);
+    let mut method_names: Vec<&str> = Vec::with_capacity(len);
+    let mut method_sigs: Vec<&str> = Vec::with_capacity(len);
+    let mut source_files: Vec<&str> = Vec::with_capacity(len);
+    let mut line_nums: Vec<i32> = Vec::with_capacity(len);
+
+    for sf in &index.stack_frames {
+        frame_ids.push(sf.frame_id);
+        class_names.push(&sf.class_name);
+        method_names.push(&sf.method_name);
+        method_sigs.push(&sf.method_signature);
+        source_files.push(&sf.source_file);
+        line_nums.push(sf.line_num);
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("frame_id", DataType::UInt64, false),
+        Field::new("class_name", DataType::Utf8, false),
+        Field::new("method_name", DataType::Utf8, false),
+        Field::new("method_signature", DataType::Utf8, false),
+        Field::new("source_file", DataType::Utf8, false),
+        Field::new("line_num", DataType::Int32, false),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(frame_ids)) as Arc<dyn Array>,
+            Arc::new(StringArray::from(class_names)) as Arc<dyn Array>,
+            Arc::new(StringArray::from(method_names)) as Arc<dyn Array>,
+            Arc::new(StringArray::from(method_sigs)) as Arc<dyn Array>,
+            Arc::new(StringArray::from(source_files)) as Arc<dyn Array>,
+            Arc::new(Int32Array::from(line_nums)) as Arc<dyn Array>,
+        ],
+    ).unwrap();
+
+    println!("  Built {} stack frames for _stack_frames.parquet", len);
+    Some(WritableBatch { file_key: "_stack_frames".into(), schema, batch })
+}
+
+/// Build `_stack_traces` WritableBatch: stack_trace_serial, thread_serial, frame_ids (list of u64).
+fn build_stack_traces_batch(index: &HprofIndex) -> Option<WritableBatch> {
+    if index.stack_traces.is_empty() {
+        return None;
+    }
+
+    let len = index.stack_traces.len();
+    let mut trace_serials: Vec<u32> = Vec::with_capacity(len);
+    let mut thread_serials: Vec<u32> = Vec::with_capacity(len);
+    let mut frame_id_lists = ListBuilder::new(UInt64Builder::new());
+
+    for st in &index.stack_traces {
+        trace_serials.push(st.stack_trace_serial);
+        thread_serials.push(st.thread_serial);
+        let values = frame_id_lists.values();
+        for &fid in &st.frame_ids {
+            values.append_value(fid);
+        }
+        frame_id_lists.append(true);
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("stack_trace_serial", DataType::UInt32, false),
+        Field::new("thread_serial", DataType::UInt32, false),
+        Field::new("frame_ids", DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))), false),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(trace_serials)) as Arc<dyn Array>,
+            Arc::new(UInt32Array::from(thread_serials)) as Arc<dyn Array>,
+            Arc::new(frame_id_lists.finish()) as Arc<dyn Array>,
+        ],
+    ).unwrap();
+
+    println!("  Built {} stack traces for _stack_traces.parquet", len);
+    Some(WritableBatch { file_key: "_stack_traces".into(), schema, batch })
+}
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -862,9 +950,15 @@ pub fn dump_objects_to_parquet(hprof: &Hprof, _flush_row_threshold: usize, robo_
         });
     });
 
-    // Write static fields
+    // Write static fields, stack frames, and stack traces through the pool
     if let Some(sb) = build_static_fields_batch(&index, robo_mode) {
         pool.write_batch(sb);
+    }
+    if let Some(sf) = build_stack_frames_batch(&index) {
+        pool.write_batch(sf);
+    }
+    if let Some(st) = build_stack_traces_batch(&index) {
+        pool.write_batch(st);
     }
 
     let pass2_dur = t1.elapsed();
@@ -874,4 +968,313 @@ pub fn dump_objects_to_parquet(hprof: &Hprof, _flush_row_threshold: usize, robo_
     let t2 = Instant::now();
     pool.close_all();
     println!("Writers closed in {:.1}s", t2.elapsed().as_secs_f64());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hprof_index::{HprofIndex, ResolvedStackFrame, ResolvedStackTrace};
+    use arrow_array::{cast::AsArray, types::UInt64Type};
+
+    /// Create a minimal HprofIndex with only stack_frames and stack_traces populated.
+    fn make_test_index<'a>(
+        frames: Vec<ResolvedStackFrame>,
+        traces: Vec<ResolvedStackTrace>,
+    ) -> HprofIndex<'a> {
+        HprofIndex {
+            utf8: HashMap::new(),
+            load_classes: HashMap::new(),
+            classes: HashMap::new(),
+            obj_id_to_class_obj_id: DashMap::new(),
+            prim_array_obj_id_to_type: DashMap::new(),
+            class_instance_field_descriptors: HashMap::new(),
+            class_field_declaring_classes: HashMap::new(),
+            stack_frames: frames,
+            stack_traces: traces,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_stack_frames_batch tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_stack_frames_batch_empty_returns_none() {
+        let index = make_test_index(vec![], vec![]);
+        assert!(build_stack_frames_batch(&index).is_none());
+    }
+
+    #[test]
+    fn test_build_stack_frames_batch_single_frame() {
+        let frames = vec![ResolvedStackFrame {
+            frame_id: 42,
+            method_name: "run".to_string(),
+            method_signature: "()V".to_string(),
+            source_file: "Main.java".to_string(),
+            class_name: "com.example.Main".to_string(),
+            line_num: 100,
+        }];
+        let index = make_test_index(frames, vec![]);
+        let wb = build_stack_frames_batch(&index).expect("should produce a batch");
+
+        assert_eq!(wb.file_key, "_stack_frames");
+        assert_eq!(wb.batch.num_rows(), 1);
+        assert_eq!(wb.batch.num_columns(), 6);
+
+        // Verify column values
+        let frame_ids = wb.batch.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(frame_ids.value(0), 42);
+
+        let class_names = wb.batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(class_names.value(0), "com.example.Main");
+
+        let method_names = wb.batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(method_names.value(0), "run");
+
+        let method_sigs = wb.batch.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(method_sigs.value(0), "()V");
+
+        let source_files = wb.batch.column(4).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(source_files.value(0), "Main.java");
+
+        let line_nums = wb.batch.column(5).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(line_nums.value(0), 100);
+    }
+
+    #[test]
+    fn test_build_stack_frames_batch_multiple_frames() {
+        let frames = vec![
+            ResolvedStackFrame {
+                frame_id: 1,
+                method_name: "methodA".to_string(),
+                method_signature: "(I)V".to_string(),
+                source_file: "A.java".to_string(),
+                class_name: "com.example.A".to_string(),
+                line_num: 10,
+            },
+            ResolvedStackFrame {
+                frame_id: 2,
+                method_name: "methodB".to_string(),
+                method_signature: "(Ljava/lang/String;)I".to_string(),
+                source_file: "B.java".to_string(),
+                class_name: "com.example.B".to_string(),
+                line_num: -1, // unknown
+            },
+            ResolvedStackFrame {
+                frame_id: 3,
+                method_name: "nativeCall".to_string(),
+                method_signature: "()J".to_string(),
+                source_file: "(unknown)".to_string(),
+                class_name: "sun.misc.Unsafe".to_string(),
+                line_num: -3, // native method
+            },
+        ];
+        let index = make_test_index(frames, vec![]);
+        let wb = build_stack_frames_batch(&index).unwrap();
+
+        assert_eq!(wb.batch.num_rows(), 3);
+
+        let frame_ids = wb.batch.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(frame_ids.value(0), 1);
+        assert_eq!(frame_ids.value(1), 2);
+        assert_eq!(frame_ids.value(2), 3);
+
+        let line_nums = wb.batch.column(5).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(line_nums.value(0), 10);
+        assert_eq!(line_nums.value(1), -1); // unknown
+        assert_eq!(line_nums.value(2), -3); // native
+    }
+
+    #[test]
+    fn test_build_stack_frames_batch_all_line_num_variants() {
+        let frames = vec![
+            ResolvedStackFrame {
+                frame_id: 1, method_name: "a".into(), method_signature: "".into(),
+                source_file: "".into(), class_name: "".into(), line_num: 42, // Normal
+            },
+            ResolvedStackFrame {
+                frame_id: 2, method_name: "b".into(), method_signature: "".into(),
+                source_file: "".into(), class_name: "".into(), line_num: -1, // Unknown
+            },
+            ResolvedStackFrame {
+                frame_id: 3, method_name: "c".into(), method_signature: "".into(),
+                source_file: "".into(), class_name: "".into(), line_num: -2, // Compiled
+            },
+            ResolvedStackFrame {
+                frame_id: 4, method_name: "d".into(), method_signature: "".into(),
+                source_file: "".into(), class_name: "".into(), line_num: -3, // Native
+            },
+        ];
+        let index = make_test_index(frames, vec![]);
+        let wb = build_stack_frames_batch(&index).unwrap();
+
+        let line_nums = wb.batch.column(5).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(line_nums.value(0), 42);
+        assert_eq!(line_nums.value(1), -1);
+        assert_eq!(line_nums.value(2), -2);
+        assert_eq!(line_nums.value(3), -3);
+    }
+
+    #[test]
+    fn test_build_stack_frames_batch_schema() {
+        let frames = vec![ResolvedStackFrame {
+            frame_id: 1, method_name: "m".into(), method_signature: "()V".into(),
+            source_file: "X.java".into(), class_name: "X".into(), line_num: 1,
+        }];
+        let index = make_test_index(frames, vec![]);
+        let wb = build_stack_frames_batch(&index).unwrap();
+
+        let fields: Vec<(&str, &DataType)> = wb.schema.fields().iter()
+            .map(|f| (f.name().as_str(), f.data_type()))
+            .collect();
+        assert_eq!(fields, vec![
+            ("frame_id", &DataType::UInt64),
+            ("class_name", &DataType::Utf8),
+            ("method_name", &DataType::Utf8),
+            ("method_signature", &DataType::Utf8),
+            ("source_file", &DataType::Utf8),
+            ("line_num", &DataType::Int32),
+        ]);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_stack_traces_batch tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_stack_traces_batch_empty_returns_none() {
+        let index = make_test_index(vec![], vec![]);
+        assert!(build_stack_traces_batch(&index).is_none());
+    }
+
+    #[test]
+    fn test_build_stack_traces_batch_single_trace() {
+        let traces = vec![ResolvedStackTrace {
+            stack_trace_serial: 1,
+            thread_serial: 10,
+            frame_ids: vec![100, 200, 300],
+        }];
+        let index = make_test_index(vec![], traces);
+        let wb = build_stack_traces_batch(&index).expect("should produce a batch");
+
+        assert_eq!(wb.file_key, "_stack_traces");
+        assert_eq!(wb.batch.num_rows(), 1);
+        assert_eq!(wb.batch.num_columns(), 3);
+
+        let trace_serials = wb.batch.column(0).as_any().downcast_ref::<UInt32Array>().unwrap();
+        assert_eq!(trace_serials.value(0), 1);
+
+        let thread_serials = wb.batch.column(1).as_any().downcast_ref::<UInt32Array>().unwrap();
+        assert_eq!(thread_serials.value(0), 10);
+
+        // Verify list column
+        let frame_ids_col = wb.batch.column(2).as_list::<i32>();
+        let row0 = frame_ids_col.value(0);
+        let values = row0.as_primitive::<UInt64Type>();
+        assert_eq!(values.values(), &[100, 200, 300]);
+    }
+
+    #[test]
+    fn test_build_stack_traces_batch_multiple_traces_varying_depth() {
+        let traces = vec![
+            ResolvedStackTrace {
+                stack_trace_serial: 1,
+                thread_serial: 10,
+                frame_ids: vec![100],
+            },
+            ResolvedStackTrace {
+                stack_trace_serial: 2,
+                thread_serial: 20,
+                frame_ids: vec![200, 300, 400, 500],
+            },
+            ResolvedStackTrace {
+                stack_trace_serial: 3,
+                thread_serial: 30,
+                frame_ids: vec![], // empty stack trace (e.g., system thread)
+            },
+        ];
+        let index = make_test_index(vec![], traces);
+        let wb = build_stack_traces_batch(&index).unwrap();
+
+        assert_eq!(wb.batch.num_rows(), 3);
+
+        let trace_serials = wb.batch.column(0).as_any().downcast_ref::<UInt32Array>().unwrap();
+        assert_eq!(trace_serials.value(0), 1);
+        assert_eq!(trace_serials.value(1), 2);
+        assert_eq!(trace_serials.value(2), 3);
+
+        let frame_ids_col = wb.batch.column(2).as_list::<i32>();
+
+        // Trace 1: single frame
+        let row0 = frame_ids_col.value(0);
+        assert_eq!(row0.as_primitive::<UInt64Type>().values(), &[100]);
+
+        // Trace 2: four frames
+        let row1 = frame_ids_col.value(1);
+        assert_eq!(row1.as_primitive::<UInt64Type>().values(), &[200, 300, 400, 500]);
+
+        // Trace 3: empty
+        let row2 = frame_ids_col.value(2);
+        assert_eq!(row2.as_primitive::<UInt64Type>().len(), 0);
+    }
+
+    #[test]
+    fn test_build_stack_traces_batch_schema() {
+        let traces = vec![ResolvedStackTrace {
+            stack_trace_serial: 1, thread_serial: 1, frame_ids: vec![1],
+        }];
+        let index = make_test_index(vec![], traces);
+        let wb = build_stack_traces_batch(&index).unwrap();
+
+        let fields: Vec<(&str, &DataType)> = wb.schema.fields().iter()
+            .map(|f| (f.name().as_str(), f.data_type()))
+            .collect();
+        assert_eq!(fields[0], ("stack_trace_serial", &DataType::UInt32));
+        assert_eq!(fields[1], ("thread_serial", &DataType::UInt32));
+        assert_eq!(fields[2].0, "frame_ids");
+        match fields[2].1 {
+            DataType::List(_) => {} // expected
+            other => panic!("Expected List type for frame_ids, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration: both batches built from same index
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_both_batches_from_populated_index() {
+        let frames = vec![
+            ResolvedStackFrame {
+                frame_id: 100, method_name: "run".into(), method_signature: "()V".into(),
+                source_file: "Thread.java".into(), class_name: "java.lang.Thread".into(), line_num: 748,
+            },
+            ResolvedStackFrame {
+                frame_id: 200, method_name: "main".into(), method_signature: "([Ljava/lang/String;)V".into(),
+                source_file: "App.java".into(), class_name: "com.example.App".into(), line_num: 15,
+            },
+        ];
+        let traces = vec![ResolvedStackTrace {
+            stack_trace_serial: 1,
+            thread_serial: 5,
+            frame_ids: vec![100, 200],
+        }];
+        let index = make_test_index(frames, traces);
+
+        let sf_batch = build_stack_frames_batch(&index).unwrap();
+        let st_batch = build_stack_traces_batch(&index).unwrap();
+
+        assert_eq!(sf_batch.batch.num_rows(), 2);
+        assert_eq!(st_batch.batch.num_rows(), 1);
+
+        // Verify frame_ids in the trace reference valid frame_id values from frames
+        let trace_frame_ids = st_batch.batch.column(2).as_list::<i32>().value(0);
+        let trace_fids = trace_frame_ids.as_primitive::<UInt64Type>();
+        let frame_id_col = sf_batch.batch.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+        for i in 0..trace_fids.len() {
+            let fid = trace_fids.value(i);
+            let found = (0..frame_id_col.len()).any(|j| frame_id_col.value(j) == fid);
+            assert!(found, "frame_id {} from trace not found in stack_frames", fid);
+        }
+    }
 }
