@@ -5,11 +5,14 @@ description: Analyze JVM heap dumps using HeapDumpStarDiver (HPROF-to-Parquet) a
 
 # Heap Dump Analysis with HeapDumpStarDiver
 
-**Argument:** `<path-to-hprof-file>` (required)
+**User provides:** `<path-to-hprof-file>` — that's it. The agent handles everything else.
 
-## Overview
+## How Skills Work
 
-This skill turns JVM heap dumps (.hprof) into queryable Parquet files using HeapDumpStarDiver, then runs automated analysis via DuckDB. It's designed for LLM-assisted heap dump triage — an AI agent can parse a multi-GB heap dump and surface findings in minutes.
+A Claude Code skill is an instruction sheet for the LLM agent. When a user says
+`/heap-analysis /tmp/dump.hprof`, Claude reads this file and follows the steps
+autonomously. The user doesn't need to know any CLI flags — the agent picks the
+right options based on the context (heap size, what's available, etc.).
 
 ## Step 1: Parse Heap Dump
 
@@ -21,10 +24,20 @@ HPROF_NAME="$(basename "$HPROF_FILE")"
 # Build if needed
 cargo build --release
 
-# Parse (robo mode recommended for LLM analysis)
+# Parse — always use robo mode for LLM analysis (bare UInt64 refs, _object_index)
 cd "$HPROF_DIR"
 time /path/to/HeapDumpStarDiver -f "$HPROF_NAME" dump-objects-to-parquet --robo-mode
 ```
+
+### HeapDumpStarDiver CLI Reference
+
+The agent should know these options to make good decisions:
+
+| Flag | Default | When to use |
+|------|---------|-------------|
+| `--robo-mode` | off | **Always use.** Produces chunked parquet with `_object_index` — required for automated queries |
+| `--flush-rows N` | 500000 | Tune if running out of memory during parquet write. Lower = less RAM, slower |
+| `-f <file>` | required | Path to the .hprof file |
 
 **Output:** `$HPROF_DIR/parquet/` with per-class Parquet files, system files (`_object_index`, `_gc_roots`, `_stack_frames`, `_stack_traces`, etc.)
 
