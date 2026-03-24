@@ -5,54 +5,48 @@ description: Analyze JVM heap dumps using HeapDumpStarDiver (HPROF-to-Parquet) a
 
 # Heap Dump Analysis with HeapDumpStarDiver
 
-**Argument:** `<path-to-hprof-file>` (required)
+Use the **heapdump MCP tools** for all heap dump analysis. Do not use bash-based workflows.
 
-## Overview
+## Workflow
 
-This skill turns JVM heap dumps (.hprof) into queryable Parquet files using HeapDumpStarDiver, then runs automated analysis via DuckDB. It's designed for LLM-assisted heap dump triage — an AI agent can parse a multi-GB heap dump and surface findings in minutes.
+1. **Convert:** `convert_heap_dump(hprof_path="/path/to/dump.hprof")` — parses the HPROF file into Parquet and opens a named session
+2. **Discover:** `list_parquet_files()` — see what tables and columns are available
+3. **Analyze:** `analyze_heap()` — run automated waste detection (duplicate strings, bad collections, boxed primitives, etc.)
+4. **Query:** `query_heap(sql="SELECT ...")` — ad-hoc DuckDB SQL against the Parquet files using `read_parquet('pattern')`
+5. **Clean up:** `close_session(id)` to keep files, or `cleanup_session(id, confirm=True)` to delete them
 
-## Step 1: Parse Heap Dump
+## Session Management
+
+- Sessions are named after the HPROF filename by default (e.g. `heap-dump-2024` from `heap-dump-2024.hprof`)
+- If only one session is open, `session_id` can be omitted from all query tools
+- Use `list_sessions()` to see all active sessions
+- Multiple sessions can be open simultaneously for comparing heap dumps
+- `query_heap` supports pagination via `limit` and `offset` parameters
+- To resume a previous analysis, use `open_session(parquet_dir="/path/to/parquet")` instead of re-converting
+
+## Prerequisites
+
+If `convert_heap_dump` reports the binary is missing:
 
 ```bash
-HPROF_FILE="<path-to-hprof-file>"
-HPROF_DIR="$(dirname "$HPROF_FILE")"
-HPROF_NAME="$(basename "$HPROF_FILE")"
+# Clone the jvm-hprof dependency (needed at ../../bitbucket/ relative to repo root)
+mkdir -p ../../bitbucket
+git clone https://bitbucket.org/ZacAttack/jvm-hprof-rs-li-hackweek.git ../../bitbucket/jvm-hprof-rs-li-hackweek
 
-# Build if needed
+# Build the binary
 cargo build --release
-
-# Parse (robo mode recommended for LLM analysis)
-cd "$HPROF_DIR"
-time /path/to/HeapDumpStarDiver -f "$HPROF_NAME" dump-objects-to-parquet --robo-mode
 ```
 
-### CLI Reference
-
-| Flag | Default | When to use |
-|------|---------|-------------|
-| `--robo-mode` | off | **Always use.** Produces chunked parquet with `_object_index` — required for automated queries |
-| `--flush-rows N` | 500000 | Tune if running out of memory during parquet write. Lower = less RAM, slower |
-| `-f <file>` | required | Path to the .hprof file |
-
-**Output:** `$HPROF_DIR/parquet/` with per-class Parquet files, system files (`_object_index`, `_gc_roots`, `_stack_frames`, `_stack_traces`, etc.)
-
-## Step 2: Automated Analysis
+The MCP server also requires Python dependencies:
 
 ```bash
-# Standard analysis (summary, top types, byte array distribution)
-python3 scripts/analyze_heap_parquet.py "$HPROF_DIR/parquet"
-
-# Memory waste analysis (duplicate strings, bad collections, boxed primitives, etc.)
-python3 scripts/analyze_heap_parquet.py "$HPROF_DIR/parquet" --waste
-
-# Tier control: 1=fast (5 checks), 2=default (10 checks), 3=thorough (12 checks)
-python3 scripts/analyze_heap_parquet.py "$HPROF_DIR/parquet" --waste --waste-tier 3
-
-# JSON output for programmatic consumption
-python3 scripts/analyze_heap_parquet.py "$HPROF_DIR/parquet" --waste --json
+python3 -m venv .venv
+.venv/bin/pip install -e .
 ```
 
-### Waste Checks
+## Waste Checks Reference
+
+The `analyze_heap` tool runs these checks, controlled by `waste_tier`:
 
 | Tier | Check | What It Detects |
 |------|-------|-----------------|
@@ -66,28 +60,28 @@ python3 scripts/analyze_heap_parquet.py "$HPROF_DIR/parquet" --waste --json
 | 2 | Class Count | >20K classes suggests classloader leak |
 | 2 | GC Roots | Root type breakdown (thread bloat, JNI leaks) |
 | 2 | DirectByteBuffer | Off-heap capacity, empty buffers |
+| 2 | Thread Stacks | Thread count and stack depth analysis |
 | 3 | Duplicate Object Arrays | Same elements in same order |
 | 3 | Estimated Shallow Size | Approximate heap usage by type |
 
-## Step 3: Ad-hoc DuckDB Queries
+## Example SQL for query_heap
 
-```bash
-cd "$HPROF_DIR/parquet"
+Parquet files use robo mode conventions: chunked files (`_chunk*.parquet`), bare UInt64 IDs for references, and a separate `_object_index` for type lookups.
 
-# Top types by count
-duckdb -c "SELECT type_name, COUNT(*) as cnt FROM read_parquet('_object_index_chunk*.parquet') GROUP BY type_name ORDER BY cnt DESC LIMIT 20;"
+```sql
+-- Top types by count
+SELECT type_name, COUNT(*) as cnt
+FROM read_parquet('_object_index_chunk*.parquet')
+GROUP BY type_name ORDER BY cnt DESC LIMIT 20
 
-# Thread stacks (requires stack frame/trace parquet output)
-duckdb -c "
+-- Thread stack analysis
 SELECT sf.class_name, sf.method_name, COUNT(*) as appearances
 FROM '_stack_traces.parquet' st, UNNEST(st.frame_ids) AS t(fid)
 JOIN '_stack_frames.parquet' sf ON sf.frame_id = t.fid
 GROUP BY sf.class_name, sf.method_name
-ORDER BY appearances DESC LIMIT 10;
-"
+ORDER BY appearances DESC LIMIT 10
 
-# Duplicate strings with waste estimate
-duckdb -c "
+-- Duplicate strings with waste estimate
 WITH str_bytes AS (
     SELECT s.obj_id, s.value as byte_id,
            md5(CAST(b.values AS VARCHAR)) as hash, len(b.values) as len
@@ -96,23 +90,14 @@ WITH str_bytes AS (
 )
 SELECT hash, COUNT(*) as dups, MIN(len) as str_len
 FROM str_bytes GROUP BY hash HAVING COUNT(*) > 1
-ORDER BY dups * str_len DESC LIMIT 20;
-"
+ORDER BY dups * str_len DESC LIMIT 20
+
+-- Look up what type an object ID belongs to
+SELECT * FROM read_parquet('_object_index_chunk*.parquet')
+WHERE obj_id = 12345678
+
+-- GC roots by type
+SELECT root_type, COUNT(*) as cnt
+FROM read_parquet('_gc_roots_chunk*.parquet')
+GROUP BY root_type ORDER BY cnt DESC
 ```
-
-## Requirements
-
-- **Rust toolchain** (for building HeapDumpStarDiver)
-- **Python 3** + `duckdb` (`pip install duckdb`)
-- **jvm-hprof** crate (dependency, see Cargo.toml)
-
-## Robo Mode vs Non-Robo Mode
-
-| Aspect | Robo Mode | Non-Robo Mode |
-|--------|-----------|---------------|
-| Files | `_chunk0.parquet`, `_chunk1.parquet`, ... | Single file per class |
-| References | Bare UInt64 IDs | STRUCT(id, type) |
-| Object index | `_object_index_chunk*.parquet` | Not available |
-| Use case | LLM/automated analysis | Human interactive exploration |
-
-Always use `--robo-mode` for automated analysis.

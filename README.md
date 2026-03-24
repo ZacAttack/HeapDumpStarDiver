@@ -108,3 +108,86 @@ HeapDumpSegment: 14
 StackTrace: 7
 HeapDumpEnd: 1
 ```
+
+## Configuring MCP For Agent Driven Analysis
+
+HeapDumpStarDiver includes an MCP (Model Context Protocol) server that lets any compatible AI agent convert heap dumps, run SQL queries, and perform automated waste detection — no manual scripting required.
+
+### Install
+
+```bash
+# 1. Build the Rust binary (see Dependencies above)
+cargo build --release
+
+# 2. Install the MCP server
+pip install heapdump-stardiver-mcp
+```
+
+Or install from source:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e .
+```
+
+### Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `convert_heap_dump` | Convert an HPROF file to Parquet and open an analysis session |
+| `open_session` | Open a session against existing Parquet files (resume previous work) |
+| `list_sessions` | Show all active sessions |
+| `close_session` | Close a session's DuckDB connection, keep files for later |
+| `cleanup_session` | Close connection and delete Parquet files |
+| `list_parquet_files` | List available tables with row counts and schemas |
+| `query_heap` | Run DuckDB SQL against the Parquet files (paginated) |
+| `analyze_heap` | Automated waste detection and heap profiling |
+
+The server also exposes reference resources (`heapdump://guides/setup`, `heapdump://guides/sql-examples`, `heapdump://guides/waste-checks`) that agents can read on demand for setup help, query examples, and waste check documentation.
+
+### Agent Configuration
+
+Each agent needs a one-line config pointing at the `heapdump-stardiver-mcp` command. The format is the same across most agents — only the config file location differs.
+
+| Agent | Config file |
+|-------|------------|
+| **Claude Code** | `.mcp.json` in repo root |
+| **Claude Desktop** | `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) |
+| **Cursor** | `.cursor/mcp.json` in repo root |
+| **Windsurf** | `~/.windsurf/mcp.json` |
+| **ChatGPT Desktop** | Settings UI → MCP servers |
+
+Add the following to the appropriate config file:
+
+```json
+{
+  "mcpServers": {
+    "heapdump-stardiver": {
+      "command": "heapdump-stardiver-mcp"
+    }
+  }
+}
+```
+
+If installing from source instead of pip, point at the venv Python:
+
+```json
+{
+  "mcpServers": {
+    "heapdump-stardiver": {
+      "command": ".venv/bin/python",
+      "args": ["-m", "mcp_server.server"]
+    }
+  }
+}
+```
+
+### Typical Agent Workflow
+
+1. **Convert:** Agent calls `convert_heap_dump(hprof_path="/path/to/dump.hprof")` — converts HPROF to Parquet and opens a session named after the file
+2. **Discover:** Agent calls `list_parquet_files()` — sees available tables and their schemas
+3. **Analyze:** Agent calls `analyze_heap()` — gets automated waste detection results
+4. **Query:** Agent calls `query_heap(sql="SELECT ...")` — runs ad-hoc DuckDB queries
+5. **Clean up:** Agent calls `close_session(id)` to keep files, or `cleanup_session(id, confirm=True)` to delete them
+
+Multiple sessions can be open simultaneously for comparing heap dumps across services or time periods.
