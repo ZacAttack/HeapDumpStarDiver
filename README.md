@@ -191,3 +191,16 @@ If installing from source instead of pip, point at the venv Python:
 5. **Clean up:** Agent calls `close_session(id)` to keep files, or `cleanup_session(id, confirm=True)` to delete them
 
 Multiple sessions can be open simultaneously for comparing heap dumps across services or time periods.
+
+### Agent Skills
+
+A `SKILL.md` file is included to help agents discover and use the MCP tools. The canonical file lives at `.claude/skills/heap-analysis/SKILL.md` and is symlinked into the skill directories of other popular agents:
+
+| Agent | Skill location |
+|-------|---------------|
+| **Claude Code** | `.claude/skills/heap-analysis/SKILL.md` (canonical) |
+| **OpenAI Codex** | `.agents/skills/heap-analysis/SKILL.md` (symlink) |
+| **Antigravity** | `.agent/skills/heap-analysis/SKILL.md` (symlink) |
+| **Cursor** | `.cursor/skills/heap-analysis/SKILL.md` (symlink) |
+
+**Windows note:** Git symlinks require Developer Mode or elevated privileges on Windows. Without this, Git creates a plain text file containing the symlink target path instead of an actual symlink. If this is an issue, copy the file manually rather than relying on the symlink.
