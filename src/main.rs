@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Zac Policzer
+
 mod commands;
 mod hprof_index;
 mod util;

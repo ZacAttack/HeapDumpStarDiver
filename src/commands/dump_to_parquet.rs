@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Zac Policzer
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use arrow_array::{Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray, StructArray, UInt16Array, UInt32Array, UInt64Array};

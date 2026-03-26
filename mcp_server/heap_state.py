@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Zac Policzer
+
 """Session state for the HeapDumpStarDiver MCP server."""
 
 import os

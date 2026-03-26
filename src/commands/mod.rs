@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Zac Policzer
+
 mod count_records;
 mod dump_objects;
 mod dump_to_parquet;

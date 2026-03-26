@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Zac Policzer
+
 use std::collections;
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Fields, Schema};

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Zac Policzer
+
 """Thin re-export layer over scripts/analyze_heap_parquet.py.
 
 Keeps one source of truth for the analysis logic — if the script evolves,

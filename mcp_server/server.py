@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Zac Policzer
+
 """MCP server for HeapDumpStarDiver — JVM heap dump analysis.
 
 Tools:

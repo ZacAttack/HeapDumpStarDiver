@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Zac Policzer
 """
 Analyze JVM heap dump parquet files produced by HeapDumpStarDiver.
 

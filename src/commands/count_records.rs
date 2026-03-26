@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Zac Policzer
+
 use std::collections::HashMap;
 use jvm_hprof::{EnumIterable, Hprof, RecordTag};
 

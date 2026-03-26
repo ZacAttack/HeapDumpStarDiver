@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Zac Policzer
+
 use std::collections::HashMap;
 use dashmap::DashMap;
 use jvm_hprof::{Hprof, Id, LineNum, LoadClass, Record, RecordTag, EzClass, build_type_hierarchy_field_descriptors};
